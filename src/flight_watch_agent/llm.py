@@ -7,39 +7,41 @@ from langchain.chat_models import init_chat_model
 from pydantic import BaseModel, Field
 
 from .config import get_config, load_env_file
+from .models import FlightSearchIntent
+from .places import airport_alias_map, airport_prompt_hints, normalise_airport_code
 
 
 DEFAULT_LLM_MODEL = "openai:gpt-4.1-mini"
 
 
-class MonitorIntent(BaseModel):
-    action: Literal["create_monitor", "unsupported"] = Field(
+class TravelPlanIntent(BaseModel):
+    action: Literal["plan_trip", "unsupported"] = Field(
         description="The user's intended action."
     )
     origin: str | None = Field(
         default=None,
-        description="Origin airport or city code, such as SHA, PVG, NRT, NYC.",
+        description="Origin city, airport name, station name, or airport code as expressed by the user.",
     )
     destination: str | None = Field(
         default=None,
-        description="Destination airport or city code, such as SHA, PVG, NRT, NYC.",
+        description="Destination city, airport name, station name, or airport code as expressed by the user.",
     )
-    depart_date: date | None = Field(
+    travel_date: date | None = Field(
         default=None,
-        description="Outbound date in ISO format.",
+        description="Travel date in ISO format.",
     )
-    return_date: date | None = Field(
+    time_preference: str | None = Field(
         default=None,
-        description="Return date in ISO format. Null for one-way trips.",
+        description="Time preference such as morning, afternoon, evening, earliest, or latest.",
     )
-    threshold_price: float | None = Field(
+    budget_threshold: float | None = Field(
         default=None,
-        description="Notify when price is less than or equal to this value.",
+        description="Preferred maximum total price.",
     )
     currency: str = Field(default="CNY", description="ISO currency code.")
-    interval_seconds: int = Field(
-        default=3600,
-        description="How often to check prices, in seconds.",
+    max_segments: int = Field(
+        default=3,
+        description="Maximum number of trip segments.",
     )
     missing_fields: list[str] = Field(default_factory=list)
     clarification: str | None = Field(
@@ -54,9 +56,14 @@ def build_default_llm(model: str | None = None):
     return init_chat_model(model_name, temperature=0)
 
 
-def parse_monitor_intent(user_input: str, llm, *, today: date | None = None) -> MonitorIntent:
+def parse_travel_plan_intent(
+    user_input: str,
+    llm,
+    *,
+    today: date | None = None,
+) -> TravelPlanIntent:
     today = today or date.today()
-    structured_llm = llm.with_structured_output(MonitorIntent)
+    structured_llm = llm.with_structured_output(TravelPlanIntent)
     result = structured_llm.invoke(
         [
             (
@@ -66,51 +73,150 @@ def parse_monitor_intent(user_input: str, llm, *, today: date | None = None) -> 
             ("human", user_input),
         ]
     )
-    if isinstance(result, MonitorIntent):
+    if isinstance(result, TravelPlanIntent):
         intent = result
     else:
-        intent = MonitorIntent.model_validate(result)
-    return _normalize_intent(intent)
+        intent = TravelPlanIntent.model_validate(result)
+    return _normalize_intent(intent, user_input=user_input)
 
 
-def required_missing_fields(intent: MonitorIntent) -> list[str]:
-    if intent.action != "create_monitor":
+def required_missing_fields(intent: TravelPlanIntent) -> list[str]:
+    if intent.action != "plan_trip":
         return ["supported_action"]
 
     missing: list[str] = []
-    for field_name in ("origin", "destination", "depart_date", "threshold_price"):
+    for field_name in ("origin", "destination", "travel_date"):
         value = getattr(intent, field_name)
         if value is None or value == "":
             missing.append(field_name)
     return missing
 
 
-def _normalize_intent(intent: MonitorIntent) -> MonitorIntent:
+def to_flight_search_intent(intent: TravelPlanIntent) -> FlightSearchIntent:
+    missing = required_missing_fields(intent)
+    if missing:
+        raise ValueError("Missing required fields: " + ", ".join(missing))
+    return FlightSearchIntent(
+        origin=_required(intent.origin),
+        destination=_required(intent.destination),
+        travel_date=_required(intent.travel_date),
+        time_preference=intent.time_preference,
+        budget_threshold=intent.budget_threshold,
+        currency=intent.currency,
+        max_segments=intent.max_segments,
+    )
+
+
+def _normalize_intent(intent: TravelPlanIntent, *, user_input: str = "") -> TravelPlanIntent:
     updates: dict[str, object] = {}
-    if intent.origin:
-        updates["origin"] = intent.origin.strip().upper()
-    if intent.destination:
-        updates["destination"] = intent.destination.strip().upper()
+    origin = _normalise_place(intent.origin)
+    destination = _normalise_place(intent.destination)
+    if origin is None or destination is None:
+        inferred_origin, inferred_destination = _infer_route_from_text(user_input)
+        origin = origin or inferred_origin
+        destination = destination or inferred_destination
+    if origin:
+        updates["origin"] = origin
+    if destination:
+        updates["destination"] = destination
+    time_preference = _normalise_time_preference(intent.time_preference or _infer_time_preference(user_input))
+    if time_preference:
+        updates["time_preference"] = time_preference
     if intent.currency:
         updates["currency"] = intent.currency.strip().upper()
+    if intent.max_segments < 1:
+        updates["max_segments"] = 1
+    elif intent.max_segments > 3:
+        updates["max_segments"] = 3
     missing = required_missing_fields(intent.model_copy(update=updates))
     updates["missing_fields"] = sorted(set(intent.missing_fields + missing))
     return intent.model_copy(update=updates)
 
 
 def _system_prompt(today: date) -> str:
+    place_hints = airport_prompt_hints()
+    time_hints = (
+        "\u4e0a\u5348/\u65e9\u4e0a -> morning; "
+        "\u4e0b\u5348 -> afternoon; \u665a\u4e0a -> evening."
+    )
     return f"""
-You extract flight price watch requests into structured data.
+You extract real-time travel planning requests into structured data.
 
 Today is {today.isoformat()}.
 
 Rules:
-- Only return create_monitor when the user asks to watch, monitor, track, or alert on flight prices.
-- Use airport or city codes when the user provides them directly.
-- If a city has multiple airports and the user did not give a code, use a common city code only when unambiguous; otherwise mark the field missing.
+- Return plan_trip when the user asks to find, compare, search, plan, or recommend travel options.
+- Preserve the user's city, airport, station name, or explicit airport code; do not invent an airport code.
+- The application will resolve airport codes from its local airport CSV and station index after this step.
+- Common airport lookup hints:
+  {place_hints}
+- Convert Chinese time preferences: {time_hints}
 - Convert relative dates into absolute ISO dates based on today.
-- If no check interval is provided, use 3600 seconds.
 - If no currency is provided, use CNY.
+- If no max_segments is provided, use 3.
 - Put every missing required field in missing_fields.
-- Required fields are origin, destination, depart_date, and threshold_price.
+- Required fields are origin, destination, and travel_date.
 """.strip()
+
+
+def _required(value):
+    if value is None:
+        raise ValueError("Required value is missing.")
+    return value
+
+
+_PLACE_ALIASES = {
+    **airport_alias_map(),
+}
+
+_TIME_ALIASES = {
+    "\u4e0a\u5348": "morning",
+    "\u65e9\u4e0a": "morning",
+    "\u65e9\u6668": "morning",
+    "\u4e0a\u5348\u51fa\u53d1": "morning",
+    "\u4e0b\u5348": "afternoon",
+    "\u5348\u540e": "afternoon",
+    "\u665a\u4e0a": "evening",
+    "\u591c\u95f4": "evening",
+    "\u6700\u65e9": "earliest",
+    "\u5c3d\u65e9": "earliest",
+    "\u6700\u665a": "latest",
+    "morning": "morning",
+    "afternoon": "afternoon",
+    "evening": "evening",
+    "earliest": "earliest",
+    "latest": "latest",
+}
+
+
+def _normalise_place(value: str | None) -> str | None:
+    return normalise_airport_code(value)
+
+
+def _infer_route_from_text(text: str) -> tuple[str | None, str | None]:
+    matches: list[tuple[int, int, str]] = []
+    for alias, code in _PLACE_ALIASES.items():
+        index = text.find(alias)
+        if index >= 0:
+            matches.append((index, -len(alias), code))
+    ordered_codes: list[str] = []
+    for _, _, code in sorted(matches):
+        if code not in ordered_codes:
+            ordered_codes.append(code)
+    if len(ordered_codes) < 2:
+        return (None, None)
+    return (ordered_codes[0], ordered_codes[1])
+
+
+def _infer_time_preference(text: str) -> str | None:
+    for alias, value in _TIME_ALIASES.items():
+        if alias in text:
+            return value
+    return None
+
+
+def _normalise_time_preference(value: str | None) -> str | None:
+    if not value:
+        return None
+    text = value.strip()
+    return _TIME_ALIASES.get(text) or _TIME_ALIASES.get(text.lower()) or text

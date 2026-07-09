@@ -1,4 +1,4 @@
-"""Flight price watch agent package."""
+"""Travel planning agent package."""
 
 __all__ = ["__version__"]
 

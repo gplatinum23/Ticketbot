@@ -1,0 +1,12 @@
+[
+  {"iata": "SIN", "name": "Singapore Changi Airport", "aliases": ["新加坡", "樟宜", "樟宜机场", "Singapore", "Changi"], "city": "新加坡", "country": "SG"},
+  {"iata": "TFU", "name": "Chengdu Tianfu International Airport", "aliases": ["成都天府", "天府机场", "天府国际机场", "成都天府国际机场"], "city": "成都", "country": "CN"},
+  {"iata": "CTU", "name": "Chengdu Shuangliu International Airport", "aliases": ["成都", "成都双流", "双流", "双流机场"], "city": "成都", "country": "CN"},
+  {"iata": "KMG", "name": "Kunming Changshui International Airport", "aliases": ["昆明", "昆明长水", "长水机场", "长水国际机场"], "city": "昆明", "country": "CN"},
+  {"iata": "NKG", "name": "Nanjing Lukou International Airport", "aliases": ["南京", "南京禄口", "禄口机场", "禄口国际机场"], "city": "南京", "country": "CN"},
+  {"iata": "BJS", "name": "Beijing city airports", "aliases": ["北京"], "city": "北京", "country": "CN"},
+  {"iata": "PEK", "name": "Beijing Capital International Airport", "aliases": ["北京首都", "首都机场"], "city": "北京", "country": "CN"},
+  {"iata": "PKX", "name": "Beijing Daxing International Airport", "aliases": ["北京大兴", "大兴机场"], "city": "北京", "country": "CN"},
+  {"iata": "SHA", "name": "Shanghai city airports", "aliases": ["上海", "上海虹桥", "虹桥机场"], "city": "上海", "country": "CN"},
+  {"iata": "PVG", "name": "Shanghai Pudong International Airport", "aliases": ["上海浦东", "浦东机场"], "city": "上海", "country": "CN"}
+]

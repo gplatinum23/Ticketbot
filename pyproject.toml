@@ -1,7 +1,7 @@
 [project]
 name = "flight-watch-agent"
 version = "0.1.0"
-description = "A LangGraph-based flight price watch agent."
+description = "A LangGraph-based travel planning agent."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -13,6 +13,13 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+]
+ctrip = [
+    "selenium-wire==5.1.0",
+    "blinker==1.7.0",
+    "pyOpenSSL<25",
+    "python-magic-bin==0.4.14; platform_system == 'Windows'",
+    "python-magic==0.4.27; platform_system != 'Windows'",
 ]
 
 [project.scripts]

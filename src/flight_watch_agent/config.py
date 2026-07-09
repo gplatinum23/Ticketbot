@@ -5,10 +5,11 @@ from pathlib import Path
 
 
 DEFAULT_ENV_FILE = ".env"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def load_env_file(path: str | Path | None = None, *, override: bool = False) -> None:
-    env_path = Path(path or os.getenv("FLIGHT_WATCH_ENV_FILE", DEFAULT_ENV_FILE))
+    env_path = _resolve_env_path(path)
     if not env_path.exists():
         return
 
@@ -28,6 +29,18 @@ def load_env_file(path: str | Path | None = None, *, override: bool = False) -> 
 def get_config(name: str, default: str | None = None) -> str | None:
     load_env_file()
     return os.getenv(name, default)
+
+
+def _resolve_env_path(path: str | Path | None = None) -> Path:
+    explicit_path = path or os.getenv("FLIGHT_WATCH_ENV_FILE")
+    if explicit_path:
+        return Path(explicit_path)
+
+    cwd_env = Path(DEFAULT_ENV_FILE)
+    if cwd_env.exists():
+        return cwd_env
+
+    return PROJECT_ROOT / DEFAULT_ENV_FILE
 
 
 def _clean_value(value: str) -> str:
