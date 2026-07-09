@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import re
 from dataclasses import dataclass
 from functools import lru_cache
@@ -10,6 +11,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_STATION_FILE = PROJECT_ROOT / "resources" / "station_name.js"
 DEFAULT_AIRPORT_FILE = PROJECT_ROOT / "resources" / "airports.csv"
+DEFAULT_AIRPORT_SUPPLEMENT_FILE = PROJECT_ROOT / "resources" / "airports.json"
 
 
 @dataclass(frozen=True)
@@ -29,6 +31,7 @@ class AirportRecord:
     region: str
     latitude: float | None = None
     longitude: float | None = None
+    city: str | None = None
 
 
 @dataclass(frozen=True)
@@ -47,6 +50,8 @@ class StationIndex:
         self.by_code: dict[str, StationRecord] = {}
         self.by_pinyin: dict[str, StationRecord] = {}
         self.city_names: set[str] = set()
+        self.city_by_pinyin: dict[str, str] = {}
+        self.primary_station_by_city: dict[str, str] = {}
         for station in stations:
             self.by_name.setdefault(station.name, station)
             self.by_code.setdefault(station.telecode.upper(), station)
@@ -54,6 +59,11 @@ class StationIndex:
             self.by_pinyin.setdefault(station.short.upper(), station)
             if station.city_name:
                 self.city_names.add(station.city_name)
+                self.city_by_pinyin.setdefault(station.pinyin.upper(), station.city_name)
+                self.city_by_pinyin.setdefault(station.short.upper(), station.city_name)
+                self.primary_station_by_city.setdefault(station.city_name, station.city_name)
+                if station.name == station.city_name:
+                    self.primary_station_by_city[station.city_name] = station.name
 
     def resolve(self, value: str) -> str | None:
         text = value.strip()
@@ -69,6 +79,16 @@ class StationIndex:
         if upper in self.by_pinyin:
             return self.by_pinyin[upper].name
         return None
+
+    def resolve_city_by_pinyin(self, value: str | None) -> str | None:
+        if not value:
+            return None
+        return self.city_by_pinyin.get(value.strip().upper())
+
+    def primary_station_for_city(self, city_name: str | None) -> str | None:
+        if not city_name:
+            return None
+        return self.primary_station_by_city.get(city_name)
 
 
 class AirportIndex:
@@ -244,13 +264,57 @@ def _load_airport_records(path: Path) -> list[AirportRecord]:
                     region=(row.get("iso_region") or "").strip().upper(),
                     latitude=_parse_float(row.get("latitude_deg")),
                     longitude=_parse_float(row.get("longitude_deg")),
+                    city=_derive_airport_city(name),
                 )
             )
     existing_codes = {airport.iata for airport in airports}
+    for airport in _load_airport_supplements(DEFAULT_AIRPORT_SUPPLEMENT_FILE):
+        if airport.iata not in existing_codes:
+            airports.append(airport)
+            existing_codes.add(airport.iata)
     for airport in _VIRTUAL_AIRPORT_RECORDS:
         if airport.iata not in existing_codes:
             airports.append(airport)
     return airports
+
+
+def _load_airport_supplements(path: Path) -> list[AirportRecord]:
+    if not path.exists():
+        return []
+    try:
+        rows = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    airports: list[AirportRecord] = []
+    if not isinstance(rows, list):
+        return airports
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        iata = str(row.get("iata") or "").strip().upper()
+        name = str(row.get("name") or "").strip()
+        country = str(row.get("country") or "").strip().upper()
+        if not iata or not name or not re.fullmatch(r"[A-Z0-9]{3}", iata):
+            continue
+        airports.append(
+            AirportRecord(
+                iata=iata,
+                name=name,
+                country=country,
+                region="",
+                city=str(row.get("city") or "").strip() or _derive_airport_city(name),
+            )
+        )
+    return airports
+
+
+def station_city_for_airport(airport: AirportRecord) -> str | None:
+    if airport.country != "CN":
+        return None
+    city = get_station_index().resolve_city_by_pinyin(airport.city)
+    if city is not None:
+        return city
+    return _TRAIN_CITY_BY_IATA.get(airport.iata)
 
 
 def _airport_query_from_value(value: str | AirportQuery) -> AirportQuery | None:
@@ -293,6 +357,31 @@ def _parse_float(value: str | None) -> float | None:
         return float(value)
     except ValueError:
         return None
+
+
+def _derive_airport_city(name: str) -> str | None:
+    cleaned = name.strip()
+    if not cleaned:
+        return None
+    multi_word_cities = (
+        "Hong Kong",
+        "Kuala Lumpur",
+        "New York",
+        "Ho Chi Minh",
+        "Los Angeles",
+        "San Francisco",
+        "Las Vegas",
+        "Phnom Penh",
+        "Abu Dhabi",
+    )
+    lowered = cleaned.casefold()
+    for city in multi_word_cities:
+        if lowered.startswith(city.casefold() + " "):
+            return city
+    first = cleaned.split()[0]
+    if first.casefold() in {"airport", "international", "regional"}:
+        return None
+    return first
 
 
 _AIRPORT_QUERY_ALIASES: dict[str, AirportQuery] = {
@@ -339,5 +428,6 @@ _VIRTUAL_AIRPORT_RECORDS = [
         name="Beijing city airports",
         country="CN",
         region="CN-11",
+        city="Beijing",
     )
 ]

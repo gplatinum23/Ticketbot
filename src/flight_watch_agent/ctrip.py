@@ -48,6 +48,7 @@ class CtripSeleniumWirePageExtractor:
         passwords: list[str] | None = None,
         cookies_file: str | os.PathLike[str] = DEFAULT_CTRIP_COOKIES_FILE,
         login_wait_seconds: int = 300,
+        manual_verification_wait_seconds: int = 0,
     ) -> None:
         self.browser = browser
         self.headless = headless
@@ -59,6 +60,7 @@ class CtripSeleniumWirePageExtractor:
         self.passwords = passwords or []
         self.cookies_file = Path(cookies_file)
         self.login_wait_seconds = login_wait_seconds
+        self.manual_verification_wait_seconds = manual_verification_wait_seconds
 
     def supports(self, url: str) -> bool:
         return urllib.parse.urlparse(url).scheme == CTRIP_SCHEME
@@ -67,6 +69,7 @@ class CtripSeleniumWirePageExtractor:
         intent = parse_ctrip_selenium_url(url)
         driver = _init_seleniumwire_driver(browser=self.browser, headless=self.headless)
         errors: list[str] = []
+        fallback_evidence: list[FlightEvidence] = []
         try:
             if self.login_allowed:
                 _CtripLoginSession(
@@ -83,11 +86,11 @@ class CtripSeleniumWirePageExtractor:
                     pass
                 try:
                     driver.get(search_url)
-                    request = driver.wait_for_request(
-                        "/international/search/api/search/batchSearch?.*",
-                        timeout=self.timeout_seconds,
+                    payload = _wait_for_ctrip_search_payload(
+                        driver,
+                        timeout_seconds=self.timeout_seconds,
+                        manual_verification_wait_seconds=self.manual_verification_wait_seconds,
                     )
-                    payload = decode_ctrip_response_body(request.response.body)
                     evidence = parse_ctrip_batch_search_payload(
                         payload,
                         intent,
@@ -95,8 +98,23 @@ class CtripSeleniumWirePageExtractor:
                         direct_only=self.direct_only,
                         max_results=self.max_results,
                     )
+                    if not evidence:
+                        evidence = _retry_after_manual_verification_if_present(
+                            driver,
+                            intent,
+                            source_url=search_url,
+                            direct_only=self.direct_only,
+                            max_results=self.max_results,
+                            timeout_seconds=self.timeout_seconds,
+                            manual_verification_wait_seconds=self.manual_verification_wait_seconds,
+                        )
                     if evidence:
-                        return evidence
+                        if _evidence_satisfies_requested_time(evidence, intent):
+                            return evidence
+                        if not fallback_evidence:
+                            fallback_evidence = evidence
+                        errors.append(f"{search_url}:NoTimePreferenceMatch:{intent.time_preference}")
+                        continue
                     errors.append(f"{search_url}:NoFlightEvidence:batchSearch returned no parsable itineraries")
                 except Exception as exc:
                     errors.append(f"{search_url}:{type(exc).__name__}:{str(exc).split('Stacktrace:')[0]}")
@@ -108,11 +126,11 @@ class CtripSeleniumWirePageExtractor:
             try:
                 search_url = "https://flights.ctrip.com/online/channel/domestic"
                 _drive_ctrip_homepage_search(driver, intent, timeout_seconds=self.timeout_seconds)
-                request = driver.wait_for_request(
-                    "/international/search/api/search/batchSearch?.*",
-                    timeout=self.timeout_seconds,
+                payload = _wait_for_ctrip_search_payload(
+                    driver,
+                    timeout_seconds=self.timeout_seconds,
+                    manual_verification_wait_seconds=self.manual_verification_wait_seconds,
                 )
-                payload = decode_ctrip_response_body(request.response.body)
                 evidence = parse_ctrip_batch_search_payload(
                     payload,
                     intent,
@@ -120,11 +138,28 @@ class CtripSeleniumWirePageExtractor:
                     direct_only=self.direct_only,
                     max_results=self.max_results,
                 )
+                if not evidence:
+                    evidence = _retry_after_manual_verification_if_present(
+                        driver,
+                        intent,
+                        source_url=search_url,
+                        direct_only=self.direct_only,
+                        max_results=self.max_results,
+                        timeout_seconds=self.timeout_seconds,
+                        manual_verification_wait_seconds=self.manual_verification_wait_seconds,
+                    )
                 if evidence:
-                    return evidence
-                errors.append("homepage_ui:NoFlightEvidence:batchSearch returned no parsable itineraries")
+                    if _evidence_satisfies_requested_time(evidence, intent):
+                        return evidence
+                    if not fallback_evidence:
+                        fallback_evidence = evidence
+                    errors.append(f"homepage_ui:NoTimePreferenceMatch:{intent.time_preference}")
+                else:
+                    errors.append("homepage_ui:NoFlightEvidence:batchSearch returned no parsable itineraries")
             except Exception as exc:
                 errors.append(f"homepage_ui:{type(exc).__name__}:{str(exc).split('Stacktrace:')[0]}")
+            if fallback_evidence:
+                return fallback_evidence
             if errors:
                 raise RuntimeError("Ctrip SeleniumWire extraction failed; attempts=" + " | ".join(errors))
             return []
@@ -165,6 +200,137 @@ def decode_ctrip_response_body(body: bytes) -> dict[str, Any]:
     except OSError:
         text = body.decode("utf-8")
     return json.loads(text)
+
+
+def _wait_for_ctrip_search_payload(
+    driver,
+    *,
+    timeout_seconds: int,
+    manual_verification_wait_seconds: int,
+) -> dict[str, Any]:
+    if _is_manual_verification_present(driver) and manual_verification_wait_seconds > 0:
+        _wait_for_manual_verification(driver, manual_verification_wait_seconds)
+
+    try:
+        request = driver.wait_for_request(
+            "/international/search/api/search/batchSearch?.*",
+            timeout=timeout_seconds,
+        )
+        if request.response is not None:
+            return decode_ctrip_response_body(request.response.body)
+    except Exception as exc:
+        initial_error = exc
+    else:
+        initial_error = RuntimeError("batchSearch request had no response body.")
+
+    payload = _extract_latest_ctrip_search_payload(driver)
+    if payload is not None:
+        return payload
+
+    if manual_verification_wait_seconds <= 0:
+        raise initial_error
+
+    _wait_for_manual_verification(driver, manual_verification_wait_seconds)
+    payload = _extract_latest_ctrip_search_payload(driver)
+    if payload is not None:
+        return payload
+
+    request = driver.wait_for_request(
+        "/international/search/api/search/batchSearch?.*",
+        timeout=timeout_seconds,
+    )
+    if request.response is None:
+        raise RuntimeError("batchSearch request had no response body after manual verification.")
+    return decode_ctrip_response_body(request.response.body)
+
+
+def _retry_after_manual_verification_if_present(
+    driver,
+    intent: FlightSearchIntent,
+    *,
+    source_url: str,
+    direct_only: bool,
+    max_results: int,
+    timeout_seconds: int,
+    manual_verification_wait_seconds: int,
+) -> list[FlightEvidence]:
+    if manual_verification_wait_seconds <= 0 or not _is_manual_verification_present(driver):
+        return []
+    _wait_for_manual_verification(driver, manual_verification_wait_seconds)
+    try:
+        payload = _wait_for_ctrip_search_payload(
+            driver,
+            timeout_seconds=timeout_seconds,
+            manual_verification_wait_seconds=0,
+        )
+    except Exception:
+        payload = _extract_latest_ctrip_search_payload(driver)
+    if payload is None:
+        return []
+    return parse_ctrip_batch_search_payload(
+        payload,
+        intent,
+        source_url=source_url,
+        direct_only=direct_only,
+        max_results=max_results,
+    )
+
+
+def _extract_latest_ctrip_search_payload(driver) -> dict[str, Any] | None:
+    requests = list(getattr(driver, "requests", []) or [])
+    for request in reversed(requests):
+        url = getattr(request, "url", "")
+        response = getattr(request, "response", None)
+        if response is None or "batchSearch" not in url:
+            continue
+        try:
+            return decode_ctrip_response_body(response.body)
+        except Exception:
+            continue
+    return None
+
+
+def _wait_for_manual_verification(driver, wait_seconds: int) -> None:
+    if wait_seconds <= 0:
+        return
+    print(
+        "Ctrip may require manual verification. "
+        f"Please complete it in the browser within {wait_seconds} seconds..."
+    )
+    deadline = time.time() + wait_seconds
+    while time.time() < deadline:
+        if not _is_manual_verification_present(driver):
+            time.sleep(2)
+            return
+        time.sleep(1)
+
+
+def _is_manual_verification_present(driver) -> bool:
+    try:
+        page_source = driver.page_source or ""
+    except Exception:
+        return False
+    verification_markers = (
+        "为保障您的安全访问",
+        "请完成以下操作",
+        "依次点击图标验证",
+        "安全访问",
+    )
+    if any(marker in page_source for marker in verification_markers):
+        return True
+    try:
+        return bool(
+            driver.execute_script(
+                """
+                const text = document.body ? document.body.innerText : "";
+                return text.includes("为保障您的安全访问")
+                  || text.includes("请完成以下操作")
+                  || text.includes("依次点击图标验证");
+                """
+            )
+        )
+    except Exception:
+        return False
 
 
 def parse_ctrip_batch_search_payload(
@@ -587,6 +753,13 @@ def _rank_ctrip_evidence(evidence: list[FlightEvidence], intent: FlightSearchInt
             item.price,
         ),
     )
+
+
+def _evidence_satisfies_requested_time(evidence: list[FlightEvidence], intent: FlightSearchIntent) -> bool:
+    preference = (intent.time_preference or "").strip().lower()
+    if preference not in {"morning", "afternoon", "evening"}:
+        return True
+    return any(_matches_time_preference(item.departure_time, preference) for item in evidence)
 
 
 def _matches_time_preference(departure_time: datetime | None, preference: str) -> bool:

@@ -25,6 +25,7 @@ def test_airport_index_loads_csv_and_resolves_structured_queries():
     assert len(index.airports) > 8000
     assert index.resolve(AirportQuery(iata="SIN")).name == "Singapore Changi Airport"
     assert index.resolve(AirportQuery(name="Nanjing Lukou", city="Nanjing", country="CN")).iata == "NKG"
+    assert index.resolve(AirportQuery(iata="PVG")).name == "Shanghai Pudong International Airport"
 
 
 def test_airport_index_normalises_names_to_iata():

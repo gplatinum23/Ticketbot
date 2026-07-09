@@ -78,6 +78,9 @@ def build_default_flight_page_extractor():
                 cookies_file=get_config("FLIGHT_WATCH_CTRIP_COOKIES_FILE", "data/ctrip_cookies.json")
                 or "data/ctrip_cookies.json",
                 login_wait_seconds=int(get_config("FLIGHT_WATCH_CTRIP_LOGIN_WAIT_SECONDS", "300") or "300"),
+                manual_verification_wait_seconds=int(
+                    get_config("FLIGHT_WATCH_CTRIP_MANUAL_VERIFICATION_WAIT_SECONDS", "0") or "0"
+                ),
             )
         ]
     )

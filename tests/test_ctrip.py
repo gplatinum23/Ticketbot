@@ -7,6 +7,8 @@ from flight_watch_agent.ctrip import (
     CtripRouteSearchTool,
     _CtripLoginSession,
     _configure_browser_options,
+    _evidence_satisfies_requested_time,
+    _is_manual_verification_present,
     build_ctrip_selenium_url,
     parse_ctrip_batch_search_payload,
     parse_ctrip_selenium_url,
@@ -285,6 +287,39 @@ def test_parse_ctrip_batch_search_payload_prioritises_time_preference_before_pri
     assert evidence[0].departure_time.hour == 6
 
 
+def test_ctrip_evidence_without_requested_time_does_not_satisfy_preference():
+    intent = FlightSearchIntent(
+        origin="NKG",
+        destination="SIN",
+        travel_date=date(2026, 7, 10),
+        time_preference="morning",
+        currency="CNY",
+    )
+    payload = {
+        "data": {
+            "flightItineraryList": [
+                _ctrip_itinerary(
+                    "MU5878",
+                    "MU9647",
+                    adult_price=900,
+                    adult_tax=126,
+                    first_departure_time="2026-07-10 20:55:00",
+                )
+            ]
+        }
+    }
+
+    evidence = parse_ctrip_batch_search_payload(
+        payload,
+        intent,
+        source_url="https://flights.ctrip.com/international/search/oneway-nkg-sin?depdate=2026-07-10",
+        direct_only=False,
+        max_results=5,
+    )
+
+    assert _evidence_satisfies_requested_time(evidence, intent) is False
+
+
 def test_ctrip_login_session_saves_only_required_cookies(tmp_path):
     cookie_file = tmp_path / "cookies.json"
     session = _CtripLoginSession(
@@ -334,6 +369,31 @@ def test_ctrip_login_is_enabled_when_account_and_password_are_configured(monkeyp
     assert extractor.passwords == ["password-a"]
 
 
+def test_ctrip_manual_verification_wait_is_configurable(monkeypatch):
+    monkeypatch.setenv("FLIGHT_WATCH_CTRIP_MANUAL_VERIFICATION_WAIT_SECONDS", "120")
+
+    extractor = build_default_flight_page_extractor().extractors[0]
+
+    assert extractor.manual_verification_wait_seconds == 120
+
+
+def test_ctrip_manual_verification_page_is_detected():
+    driver = FakeDriver(
+        """
+        <div>为保障您的安全访问，请完成以下操作</div>
+        <div>依次点击图标验证</div>
+        """
+    )
+
+    assert _is_manual_verification_present(driver) is True
+
+
+def test_ctrip_normal_page_is_not_manual_verification():
+    driver = FakeDriver("<div>南京 到 新加坡 航班列表</div>")
+
+    assert _is_manual_verification_present(driver) is False
+
+
 def test_default_flight_search_uses_only_ctrip_source():
     search = build_default_flight_web_search_tool()
 
@@ -364,6 +424,14 @@ class FakeBrowserOptions:
 
     def add_experimental_option(self, name: str, value) -> None:
         self.experimental_options[name] = value
+
+
+class FakeDriver:
+    def __init__(self, page_source: str) -> None:
+        self.page_source = page_source
+
+    def execute_script(self, _script: str):
+        return False
 
 
 def _ctrip_itinerary(

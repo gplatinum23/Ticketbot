@@ -8,6 +8,22 @@ from typing import Protocol, TypedDict
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
 
+from .agent_models import (
+    CandidateHub,
+    QueryBudget,
+    QueryPlan,
+    QueryPlanItem,
+    RegionInfo,
+    RouteEdge,
+    StrategySelection,
+)
+from .agent_nodes import (
+    build_query_plan as build_agent_query_plan,
+    classify_region as classify_agent_region,
+    generate_candidate_hubs_for_places,
+    generate_candidate_hubs as generate_agent_candidate_hubs,
+    select_strategies as select_agent_strategies,
+)
 from .flight_react import (
     FlightEvidenceJudge,
     FlightEvidenceVerifier,
@@ -42,6 +58,7 @@ class CandidateRoute:
     summary: str
     flight_option: FlightOption | None = None
     train_option: TrainOption | None = None
+    route_edges: list[RouteEdge] | None = None
     transfer_city: str | None = None
     transfer_airport: str | None = None
     transfer_wait_minutes: int | None = None
@@ -50,6 +67,11 @@ class CandidateRoute:
 
 class TravelPlanState(TypedDict, total=False):
     intent: FlightSearchIntent
+    region_info: RegionInfo
+    strategy_selection: StrategySelection
+    candidate_hubs: list[CandidateHub]
+    query_plan: QueryPlan
+    route_edges: list[RouteEdge]
     train_options: list[TrainOption]
     verified_flight_options: list[FlightOption]
     transfer_train_options: list[TrainOption]
@@ -79,105 +101,112 @@ def build_travel_plan_graph(
     )
     graph = StateGraph(TravelPlanState)
 
-    def query_train_options(state: TravelPlanState) -> TravelPlanState:
-        if train_provider is None:
-            return {**state, "train_options": []}
-        warnings = list(state.get("warnings", []))
-        try:
-            train_options = train_provider.query_train_options(state["intent"])
-        except Exception as exc:
-            warnings.append(f"train_query_failed:{exc}")
-            train_options = []
-        return {**state, "train_options": train_options, "warnings": warnings}
+    def classify_region(state: TravelPlanState) -> TravelPlanState:
+        return {**state, "region_info": classify_agent_region(state["intent"])}
 
-    def react_search_flights(state: TravelPlanState) -> TravelPlanState:
-        react_state = react_search.invoke({"intent": state["intent"]})
+    def select_strategies(state: TravelPlanState) -> TravelPlanState:
         return {
             **state,
-            "verified_flight_options": react_state.get("verified_flight_options", []),
-            "flight_search_debug": {
-                "iteration": react_state.get("iteration", 0),
-                "search_queries": react_state.get("search_queries", []),
-                "raw_results": react_state.get("raw_results", []),
-                "extracted_evidence": react_state.get("extracted_evidence", []),
-                "judged_evidence": react_state.get("judged_evidence", []),
-                "verified_flight_options": react_state.get("verified_flight_options", []),
-                "warnings": react_state.get("warnings", []),
-            },
-            "warnings": state.get("warnings", []) + react_state.get("warnings", []),
+            "strategy_selection": select_agent_strategies(
+                state["intent"],
+                state["region_info"],
+            ),
         }
 
-    def query_transfer_options(state: TravelPlanState) -> TravelPlanState:
-        if train_provider is None:
-            return {
-                **state,
-                "transfer_train_options": [],
-                "transfer_flight_options": [],
-                "transfer_search_debug": {"hubs": [], "searched": []},
-            }
-
-        intent = state["intent"]
-        hubs = _dedupe_hubs(
-            transfer_hubs
-            or _default_transfer_hubs(destination_code=intent.destination)
+    def generate_candidate_hubs(state: TravelPlanState) -> TravelPlanState:
+        hubs = generate_agent_candidate_hubs(
+            state["intent"],
+            state["strategy_selection"],
+            budget=QueryBudget(max_hubs_per_strategy=50, max_flight_queries=50, max_train_queries=50)
+            if transfer_hubs is not None
+            else None,
         )
+        if transfer_hubs is not None:
+            allowed = set(_dedupe_hubs(transfer_hubs))
+            hubs = [
+                hub
+                for hub in hubs
+                if any(code in allowed for code in hub.airport_codes)
+                or hub.hub_id.upper() in allowed
+            ]
+            explicit_hubs = generate_candidate_hubs_for_places(
+                transfer_hubs,
+                state["strategy_selection"],
+            )
+            existing = {hub.hub_id for hub in hubs}
+            hubs.extend(hub for hub in explicit_hubs if hub.hub_id not in existing)
+        return {**state, "candidate_hubs": hubs}
+
+    def build_query_plan(state: TravelPlanState) -> TravelPlanState:
+        query_plan = build_agent_query_plan(
+            state["intent"],
+            state["strategy_selection"],
+            state["candidate_hubs"],
+        )
+        warnings = list(state.get("warnings", [])) + query_plan.warnings
+        return {**state, "query_plan": query_plan, "warnings": warnings}
+
+    def execute_query_plan(state: TravelPlanState) -> TravelPlanState:
+        query_plan = state["query_plan"]
         warnings = list(state.get("warnings", []))
+        train_options: list[TrainOption] = []
+        verified_flight_options: list[FlightOption] = []
         transfer_train_options: list[TrainOption] = []
         transfer_flight_options: list[FlightOption] = []
-        searched: list[dict[str, object]] = []
+        route_edges: list[RouteEdge] = []
+        flight_search_debug: dict[str, object] = _empty_flight_debug()
+        transfer_search_debug: dict[str, object] = {"hubs": [], "searched": []}
 
-        for hub_code in hubs:
-            if hub_code in {intent.origin, intent.destination}:
+        for item in query_plan.items:
+            if not item.executable:
+                warnings.append(f"query_not_implemented:{item.query_id}")
+                continue
+            if item.mode == "train":
+                if train_provider is None:
+                    continue
+                try:
+                    options = train_provider.query_train_options(_intent_for_query_item(state["intent"], item))
+                except Exception as exc:
+                    warnings.append(f"train_query_failed:{item.query_id}:{exc}")
+                    continue
+                best_options = sorted(options, key=_train_sort_key)[:3]
+                if item.strategy == "direct_train":
+                    train_options.extend(best_options)
+                elif item.strategy == "train_flight":
+                    transfer_train_options.extend(best_options)
+                route_edges.extend(_train_edges_from_options(best_options, item, state["intent"].currency))
                 continue
 
-            train_intent = FlightSearchIntent(
-                origin=intent.origin,
-                destination=hub_code,
-                travel_date=intent.travel_date,
-                currency=intent.currency,
-            )
-            try:
-                hub_trains = train_provider.query_train_options(train_intent)
-            except Exception as exc:
-                warnings.append(f"transfer_train_query_failed:{hub_code}:{exc}")
-                continue
-            if not hub_trains:
-                searched.append({"hub": hub_code, "trains": 0, "flights": 0})
-                continue
-
-            best_trains = sorted(hub_trains, key=_train_sort_key)[:3]
-            transfer_train_options.extend(best_trains)
-
-            flight_intent = FlightSearchIntent(
-                origin=hub_code,
-                destination=intent.destination,
-                travel_date=intent.travel_date,
-                time_preference=intent.time_preference,
-                budget_threshold=intent.budget_threshold,
-                currency=intent.currency,
-                max_segments=intent.max_segments,
-            )
-            react_state = react_search.invoke({"intent": flight_intent})
-            hub_flights = react_state.get("verified_flight_options", [])
-            transfer_flight_options.extend(hub_flights)
-            warnings.extend(
-                f"transfer_flight:{hub_code}:{warning}"
-                for warning in react_state.get("warnings", [])
-            )
-            searched.append(
-                {
-                    "hub": hub_code,
-                    "trains": len(best_trains),
-                    "flights": len(hub_flights),
-                    "queries": react_state.get("search_queries", []),
-                }
-            )
+            react_state = react_search.invoke({"intent": _intent_for_query_item(state["intent"], item)})
+            flight_options = react_state.get("verified_flight_options", [])
+            if item.strategy == "direct_flight":
+                verified_flight_options.extend(flight_options)
+                flight_search_debug = _react_debug(react_state)
+                warnings.extend(react_state.get("warnings", []))
+            elif item.strategy == "train_flight":
+                transfer_flight_options.extend(flight_options)
+                warnings.extend(
+                    f"transfer_flight:{item.hub_id}:{warning}"
+                    for warning in react_state.get("warnings", [])
+                )
+                _append_transfer_debug(transfer_search_debug, item, react_state, flight_options)
+            else:
+                warnings.extend(
+                    f"{item.strategy}:{item.hub_id}:{warning}"
+                    for warning in react_state.get("warnings", [])
+                )
+                _append_transfer_debug(transfer_search_debug, item, react_state, flight_options)
+            route_edges.extend(_flight_edges_from_options(flight_options, item))
 
         return {
             **state,
+            "train_options": train_options,
+            "verified_flight_options": verified_flight_options,
             "transfer_train_options": transfer_train_options,
             "transfer_flight_options": transfer_flight_options,
-            "transfer_search_debug": {"hubs": hubs, "searched": searched},
+            "route_edges": route_edges,
+            "flight_search_debug": flight_search_debug,
+            "transfer_search_debug": transfer_search_debug,
             "warnings": warnings,
         }
 
@@ -209,6 +238,9 @@ def build_travel_plan_graph(
             trains=state.get("transfer_train_options", []),
             flights=state.get("transfer_flight_options", []),
         )
+        edge_transfer_routes = _build_two_leg_routes_from_edges(state.get("route_edges", []))
+        if edge_transfer_routes:
+            transfer_routes = edge_transfer_routes
         routes.extend(transfer_routes)
 
         return {**state, "candidate_routes": sorted(routes, key=_route_sort_key)}
@@ -249,6 +281,9 @@ def build_travel_plan_graph(
             if route.route_type == "train_flight":
                 lines.append(f"{index}. {route.summary}")
                 continue
+            if route.route_type in {"flight_train", "train_train", "flight_flight"}:
+                lines.append(f"{index}. {route.summary}")
+                continue
 
             option = route.flight_option
             if option is None:
@@ -262,17 +297,21 @@ def build_travel_plan_graph(
             lines.append("Warnings: " + "; ".join(warnings))
         return {**state, "response": "\n".join(lines)}
 
-    graph.add_node("query_train_options", query_train_options)
-    graph.add_node("react_search_flights", react_search_flights)
-    graph.add_node("query_transfer_options", query_transfer_options)
+    graph.add_node("classify_region", classify_region)
+    graph.add_node("select_strategies", select_strategies)
+    graph.add_node("generate_candidate_hubs", generate_candidate_hubs)
+    graph.add_node("build_query_plan", build_query_plan)
+    graph.add_node("execute_query_plan", execute_query_plan)
     graph.add_node("build_candidate_routes", build_candidate_routes)
     graph.add_node("rank_routes", rank_routes)
     graph.add_node("render_response", render_response)
 
-    graph.add_edge(START, "query_train_options")
-    graph.add_edge("query_train_options", "react_search_flights")
-    graph.add_edge("react_search_flights", "query_transfer_options")
-    graph.add_edge("query_transfer_options", "build_candidate_routes")
+    graph.add_edge(START, "classify_region")
+    graph.add_edge("classify_region", "select_strategies")
+    graph.add_edge("select_strategies", "generate_candidate_hubs")
+    graph.add_edge("generate_candidate_hubs", "build_query_plan")
+    graph.add_edge("build_query_plan", "execute_query_plan")
+    graph.add_edge("execute_query_plan", "build_candidate_routes")
     graph.add_edge("build_candidate_routes", "rank_routes")
     graph.add_edge("rank_routes", "render_response")
     graph.add_edge("render_response", END)
@@ -321,6 +360,253 @@ def _summarise_transfer_route(
         f"train {train.train_code} {train.start_time}-{train.arrive_time} {train_price_text} CNY; "
         f"{flight_text}{wait_text}"
     )
+
+
+def _empty_flight_debug() -> dict[str, object]:
+    return {
+        "iteration": 0,
+        "search_queries": [],
+        "raw_results": [],
+        "extracted_evidence": [],
+        "judged_evidence": [],
+        "verified_flight_options": [],
+        "warnings": [],
+    }
+
+
+def _react_debug(react_state: dict[str, object]) -> dict[str, object]:
+    return {
+        "iteration": react_state.get("iteration", 0),
+        "search_queries": react_state.get("search_queries", []),
+        "raw_results": react_state.get("raw_results", []),
+        "extracted_evidence": react_state.get("extracted_evidence", []),
+        "judged_evidence": react_state.get("judged_evidence", []),
+        "verified_flight_options": react_state.get("verified_flight_options", []),
+        "warnings": react_state.get("warnings", []),
+    }
+
+
+def _append_transfer_debug(
+    debug: dict[str, object],
+    item: QueryPlanItem,
+    react_state: dict[str, object],
+    flight_options: list[FlightOption],
+) -> None:
+    searched = debug.setdefault("searched", [])
+    if isinstance(searched, list):
+        searched.append(
+            {
+                "hub": item.hub_id,
+                "query_id": item.query_id,
+                "flights": len(flight_options),
+                "queries": react_state.get("search_queries", []),
+            }
+        )
+    hubs = debug.setdefault("hubs", [])
+    if isinstance(hubs, list) and item.hub_id and item.hub_id not in hubs:
+        hubs.append(item.hub_id)
+
+
+def _intent_for_query_item(base_intent: FlightSearchIntent, item: QueryPlanItem) -> FlightSearchIntent:
+    return FlightSearchIntent(
+        origin=item.origin,
+        destination=item.destination,
+        travel_date=item.travel_date,
+        time_preference=base_intent.time_preference,
+        budget_threshold=base_intent.budget_threshold,
+        currency=base_intent.currency,
+        max_segments=base_intent.max_segments,
+    )
+
+
+def _train_edges_from_options(
+    options: list[TrainOption],
+    item: QueryPlanItem,
+    currency: str,
+) -> list[RouteEdge]:
+    edges: list[RouteEdge] = []
+    for option in options:
+        edges.append(
+            RouteEdge(
+                edge_id=f"{item.query_id}:{option.train_code}:{option.start_time}",
+                mode="train",
+                strategy=item.strategy,
+                origin=option.from_station,
+                destination=option.to_station,
+                travel_date=option.travel_date,
+                price=option.lowest_price,
+                currency=currency,
+                departure_time=option.start_time,
+                arrival_time=option.arrive_time,
+                source="12306_mcp",
+                confidence=0.95,
+                hub_id=item.hub_id,
+                leg_index=item.leg_index,
+                raw_option=option,
+            )
+        )
+    return edges
+
+
+def _flight_edges_from_options(
+    options: list[FlightOption],
+    item: QueryPlanItem,
+) -> list[RouteEdge]:
+    edges: list[RouteEdge] = []
+    for option in options:
+        edges.append(
+            RouteEdge(
+                edge_id=f"{item.query_id}:{option.origin}:{option.destination}:{option.price}",
+                mode="flight",
+                strategy=item.strategy,
+                origin=option.origin,
+                destination=option.destination,
+                travel_date=option.travel_date,
+                price=option.price,
+                currency=option.currency,
+                departure_time=option.departure_time,
+                arrival_time=option.arrival_time,
+                source="flight_page_search",
+                confidence=0.8 if option.reliability == "verified" else 0.6,
+                hub_id=item.hub_id,
+                leg_index=item.leg_index,
+                raw_option=option,
+            )
+        )
+    return edges
+
+
+def _build_two_leg_routes_from_edges(edges: list[RouteEdge]) -> list[CandidateRoute]:
+    first_edges: dict[tuple[str, str], list[RouteEdge]] = {}
+    second_edges: dict[tuple[str, str], list[RouteEdge]] = {}
+    for edge in edges:
+        if edge.strategy in {"direct_train", "direct_flight"} or not edge.hub_id:
+            continue
+        key = (edge.strategy, edge.hub_id)
+        if edge.leg_index == 1:
+            first_edges.setdefault(key, []).append(edge)
+        if edge.leg_index == 2:
+            second_edges.setdefault(key, []).append(edge)
+
+    routes: list[CandidateRoute] = []
+    for key, first_group in first_edges.items():
+        strategy, hub_id = key
+        for first_edge in first_group:
+            if first_edge.price is None:
+                continue
+            for second_edge in second_edges.get(key, []):
+                if second_edge.price is None:
+                    continue
+                wait_minutes = _compute_wait_minutes(first_edge.arrival_time, second_edge.departure_time)
+                if wait_minutes is not None and wait_minutes < 60:
+                    continue
+                total_price = first_edge.price + second_edge.price
+                routes.append(
+                    CandidateRoute(
+                        route_id=f"{strategy}:{hub_id}:{first_edge.edge_id}:{second_edge.edge_id}",
+                        route_type=strategy,
+                        total_price=total_price,
+                        summary=_summarise_two_leg_route(
+                            strategy=strategy,
+                            first_edge=first_edge,
+                            second_edge=second_edge,
+                            total_price=total_price,
+                            wait_minutes=wait_minutes,
+                        ),
+                        train_option=_first_train_option(first_edge, second_edge),
+                        flight_option=_first_flight_option(first_edge, second_edge),
+                        route_edges=[first_edge, second_edge],
+                        transfer_city=_transfer_city_from_edges(first_edge, second_edge),
+                        transfer_airport=_transfer_airport_from_edges(first_edge, second_edge),
+                        transfer_wait_minutes=wait_minutes,
+                    )
+                )
+    return sorted(routes, key=_route_sort_key)[:12]
+
+
+def _summarise_two_leg_route(
+    *,
+    strategy: str,
+    first_edge: RouteEdge,
+    second_edge: RouteEdge,
+    total_price: float,
+    wait_minutes: int | None,
+) -> str:
+    wait_text = f"; wait={wait_minutes}min" if wait_minutes is not None else ""
+    return (
+        f"{_strategy_label(strategy)} via {_transfer_city_from_edges(first_edge, second_edge) or first_edge.destination} "
+        f"total {total_price:.2f} {first_edge.currency}; "
+        f"{_edge_summary(first_edge)}; {_edge_summary(second_edge)}{wait_text}"
+    )
+
+
+def _strategy_label(strategy: str) -> str:
+    return {
+        "train_flight": "Train+Flight",
+        "flight_train": "Flight+Train",
+        "train_train": "Train+Train",
+        "flight_flight": "Flight+Flight",
+    }.get(strategy, strategy)
+
+
+def _edge_summary(edge: RouteEdge) -> str:
+    price_text = "price unavailable" if edge.price is None else f"{edge.price:.2f} {edge.currency}"
+    time_text = _edge_time_text(edge)
+    if edge.mode == "train" and isinstance(edge.raw_option, TrainOption):
+        return f"train {edge.raw_option.train_code} {edge.origin}->{edge.destination}{time_text} {price_text}"
+    if edge.mode == "flight" and isinstance(edge.raw_option, FlightOption):
+        metadata = edge.raw_option.evidence[0].metadata or {} if edge.raw_option.evidence else {}
+        flight_no = metadata.get("flight_no") or "unknown flight"
+        return f"flight {flight_no} {edge.origin}->{edge.destination}{time_text} {price_text}"
+    return f"{edge.mode} {edge.origin}->{edge.destination}{time_text} {price_text}"
+
+
+def _edge_time_text(edge: RouteEdge) -> str:
+    start = _format_time_value(edge.departure_time)
+    end = _format_time_value(edge.arrival_time)
+    if start and end:
+        return f" {start}-{end}"
+    return ""
+
+
+def _format_time_value(value: datetime | str | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime("%H:%M")
+    return str(value)
+
+
+def _first_train_option(first_edge: RouteEdge, second_edge: RouteEdge) -> TrainOption | None:
+    if isinstance(first_edge.raw_option, TrainOption):
+        return first_edge.raw_option
+    if isinstance(second_edge.raw_option, TrainOption):
+        return second_edge.raw_option
+    return None
+
+
+def _first_flight_option(first_edge: RouteEdge, second_edge: RouteEdge) -> FlightOption | None:
+    if isinstance(first_edge.raw_option, FlightOption):
+        return first_edge.raw_option
+    if isinstance(second_edge.raw_option, FlightOption):
+        return second_edge.raw_option
+    return None
+
+
+def _transfer_city_from_edges(first_edge: RouteEdge, second_edge: RouteEdge) -> str | None:
+    if first_edge.mode == "train":
+        return first_edge.destination
+    if second_edge.mode == "train":
+        return second_edge.origin
+    return first_edge.destination
+
+
+def _transfer_airport_from_edges(first_edge: RouteEdge, second_edge: RouteEdge) -> str | None:
+    if first_edge.mode == "flight":
+        return first_edge.destination
+    if second_edge.mode == "flight":
+        return second_edge.origin
+    return None
 
 
 def _build_transfer_routes(
@@ -390,6 +676,29 @@ def _compute_transfer_wait_minutes(train_arrive: str, flight_departure: datetime
         return None
     departure_minutes = flight_departure.hour * 60 + flight_departure.minute
     return departure_minutes - train_minutes
+
+
+def _compute_wait_minutes(
+    first_arrival: datetime | str | None,
+    second_departure: datetime | str | None,
+) -> int | None:
+    first_minutes = _minutes_since_midnight(first_arrival)
+    second_minutes = _minutes_since_midnight(second_departure)
+    if first_minutes is None or second_minutes is None:
+        return None
+    return second_minutes - first_minutes
+
+
+def _minutes_since_midnight(value: datetime | str | None) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.hour * 60 + value.minute
+    try:
+        hour, minute = value.split(":")[:2]
+        return int(hour) * 60 + int(minute)
+    except (AttributeError, ValueError):
+        return None
 
 
 def _dedupe_hubs(hubs: list[str]) -> list[str]:
