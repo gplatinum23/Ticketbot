@@ -5,6 +5,7 @@ from .ctrip import CtripRouteSearchTool, CtripSeleniumWirePageExtractor
 from .flight_react import (
     CompositePageExtractor,
     CompositeWebSearchTool,
+    LlmFlightActionPlanner,
     LlmFlightEvidenceJudge,
     build_react_flight_search_graph,
 )
@@ -22,6 +23,7 @@ def build_default_request_agent(
     *,
     include_train: bool = True,
     progress_reporter: ProgressReporter | None = None,
+    human_verification_handler=None,
 ):
     load_env_file()
     llm = build_default_llm(llm_model)
@@ -33,6 +35,7 @@ def build_default_request_agent(
             fast_llm=fast_llm,
             include_train=include_train,
             progress_reporter=progress_reporter,
+            human_verification_handler=human_verification_handler,
         ),
         progress_reporter=progress_reporter,
     )
@@ -45,6 +48,7 @@ def build_default_travel_plan_agent(
     fast_llm=None,
     include_train: bool = True,
     progress_reporter: ProgressReporter | None = None,
+    human_verification_handler=None,
 ):
     load_env_file()
     llm = llm or build_default_llm()
@@ -54,9 +58,11 @@ def build_default_travel_plan_agent(
         page_extractor=build_default_flight_page_extractor(),
         train_provider=Mcp12306TrainProvider() if include_train else None,
         evidence_judge=LlmFlightEvidenceJudge(fast_llm),
+        flight_action_planner=LlmFlightActionPlanner(fast_llm),
         hub_planner=LlmHubPlanner(fast_llm),
         route_planner=LlmRoutePlanner(_build_route_llm(fast_llm)),
         progress_reporter=progress_reporter,
+        human_verification_handler=human_verification_handler,
     )
     return graph
 
@@ -65,19 +71,22 @@ def build_default_flight_search_agent(
     *,
     llm=None,
     use_llm_judge: bool = True,
-    max_iterations: int = 3,
+    max_iterations: int = 4,
     progress_reporter: ProgressReporter | None = None,
 ):
     load_env_file()
     evidence_judge = None
+    action_planner = None
     if use_llm_judge:
         llm = llm or _build_fast_llm(build_default_llm())
         evidence_judge = LlmFlightEvidenceJudge(llm)
+        action_planner = LlmFlightActionPlanner(llm)
 
     return build_react_flight_search_graph(
         web_search=build_default_flight_web_search_tool(),
         page_extractor=build_default_flight_page_extractor(),
         evidence_judge=evidence_judge,
+        action_planner=action_planner,
         max_iterations=max_iterations,
         progress_reporter=progress_reporter,
     )

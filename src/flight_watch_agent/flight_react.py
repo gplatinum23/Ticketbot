@@ -5,15 +5,24 @@ import json
 import re
 import urllib.parse
 import urllib.request
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
-from typing import Protocol, TypedDict
+from typing import Callable, Literal, Protocol, TypedDict
 
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command, interrupt
 from pydantic import BaseModel, Field
 
-from .models import FlightEvidence, FlightOption, FlightSearchIntent, SearchResult
+from .models import (
+    FlightEvidence,
+    FlightOption,
+    FlightPageAttemptResult,
+    FlightSearchIntent,
+    SearchResult,
+)
 from .progress import ProgressReporter, get_progress_reporter
 
 
@@ -43,6 +52,101 @@ class FlightEvidenceJudge(Protocol):
         evidence: list[FlightEvidence],
     ) -> list[FlightEvidence]:
         """Judge and normalise extracted web evidence."""
+
+
+FlightSearchAction = Literal[
+    "search_primary",
+    "search_secondary",
+    "search_homepage",
+    "refresh_capture",
+    "await_human_verification",
+    "relax_time_preference",
+    "finish",
+    "stop",
+]
+
+
+class FlightSearchObservation(BaseModel):
+    action_id: str
+    action: FlightSearchAction
+    entrypoint: str
+    status: str
+    evidence_count: int = 0
+    strict_match_count: int = 0
+    fallback_match_count: int = 0
+    warning: str | None = None
+
+
+class FlightSearchActionDecision(BaseModel):
+    action: FlightSearchAction
+    reason: str = Field(default="", description="Short operational reason, not hidden reasoning.")
+
+
+class FlightActionPlanner(Protocol):
+    def plan(
+        self,
+        *,
+        intent: FlightSearchIntent,
+        observation: FlightSearchObservation,
+        action_history: list[dict[str, object]],
+        remaining_actions: int,
+    ) -> FlightSearchActionDecision:
+        """Choose the next bounded page-search action."""
+
+
+class LlmFlightActionPlanner:
+    def __init__(self, llm) -> None:
+        self.llm = llm
+
+    def plan(
+        self,
+        *,
+        intent: FlightSearchIntent,
+        observation: FlightSearchObservation,
+        action_history: list[dict[str, object]],
+        remaining_actions: int,
+    ) -> FlightSearchActionDecision:
+        structured = self.llm.with_structured_output(FlightSearchActionDecision)
+        response = structured.invoke(
+            [
+                ("system", _flight_action_planner_prompt()),
+                (
+                    "human",
+                    json.dumps(
+                        {
+                            "intent": {
+                                "origin": intent.origin,
+                                "destination": intent.destination,
+                                "travel_date": intent.travel_date.isoformat(),
+                                "time_preference": intent.time_preference,
+                                "currency": intent.currency,
+                            },
+                            "observation": observation.model_dump(mode="json"),
+                            "action_history": action_history,
+                            "remaining_actions": remaining_actions,
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
+            ]
+        )
+        if isinstance(response, FlightSearchActionDecision):
+            return response
+        return FlightSearchActionDecision.model_validate(response)
+
+
+class CompiledReactFlightSearchGraph:
+    def __init__(self, graph) -> None:
+        self._graph = graph
+
+    def invoke(self, state, config=None, **kwargs):
+        actual_config = config or {
+            "configurable": {"thread_id": f"flight-{uuid.uuid4().hex}"}
+        }
+        return self._graph.invoke(state, config=actual_config, **kwargs)
+
+    def get_graph(self, *args, **kwargs):
+        return self._graph.get_graph(*args, **kwargs)
 
 
 @dataclass(frozen=True)
@@ -338,6 +442,41 @@ class CompositePageExtractor:
                 return extractor.extract(url)
         return []
 
+    def extract_attempt(
+        self,
+        url: str,
+        *,
+        entrypoint: str,
+        action_id: str,
+        force_refresh: bool = False,
+    ) -> FlightPageAttemptResult:
+        for extractor in self.extractors:
+            supports = getattr(extractor, "supports", None)
+            if supports is not None and not supports(url):
+                continue
+            adaptive_extract = getattr(extractor, "extract_attempt", None)
+            if callable(adaptive_extract):
+                return adaptive_extract(
+                    url,
+                    entrypoint=entrypoint,
+                    action_id=action_id,
+                    force_refresh=force_refresh,
+                )
+            evidence = extractor.extract(url)
+            return FlightPageAttemptResult(
+                status="success" if evidence else "no_evidence",
+                evidence=evidence,
+                entrypoint=entrypoint,
+                source_url=url,
+            )
+        return FlightPageAttemptResult(
+            status="no_evidence",
+            evidence=[],
+            entrypoint=entrypoint,
+            source_url=url,
+            warning="no compatible page extractor",
+        )
+
 
 class SkyscannerRouteSearchTool:
     def search(self, query: str) -> list[SearchResult]:
@@ -411,6 +550,18 @@ class ReactFlightSearchState(TypedDict, total=False):
     judged_evidence: list[FlightEvidence]
     verified_flight_options: list[FlightOption]
     warnings: list[str]
+    observations: list[dict[str, object]]
+    action_history: list[dict[str, object]]
+    attempted_entrypoints: list[str]
+    remaining_actions: int
+    strict_evidence: list[FlightEvidence]
+    fallback_evidence: list[FlightEvidence]
+    current_action: dict[str, object]
+    human_interrupt_count: int
+    termination_reason: str | None
+    _last_entrypoint: str
+    _last_status: str
+    _last_warning: str | None
 
 
 def build_react_flight_search_graph(
@@ -418,142 +569,509 @@ def build_react_flight_search_graph(
     web_search: WebSearchTool,
     page_extractor: PageExtractor,
     evidence_judge: FlightEvidenceJudge | None = None,
+    action_planner: FlightActionPlanner | None = None,
     verifier: FlightEvidenceVerifier | None = None,
-    max_iterations: int = 3,
+    max_iterations: int = 4,
     progress_reporter: ProgressReporter | None = None,
 ):
     evidence_verifier = verifier or FlightEvidenceVerifier()
     progress = get_progress_reporter(progress_reporter)
     graph = StateGraph(ReactFlightSearchState)
 
-    def generate_search_plan(state: ReactFlightSearchState) -> ReactFlightSearchState:
+    def initialize_search(state: ReactFlightSearchState) -> ReactFlightSearchState:
+        max_actions = state.get("max_iterations", max_iterations)
+        return {
+            **state,
+            "iteration": state.get("iteration", 0),
+            "max_iterations": max_actions,
+            "search_queries": list(state.get("search_queries", [])),
+            "raw_results": list(state.get("raw_results", [])),
+            "extracted_evidence": list(state.get("extracted_evidence", [])),
+            "judged_evidence": list(state.get("judged_evidence", [])),
+            "verified_flight_options": list(state.get("verified_flight_options", [])),
+            "warnings": list(state.get("warnings", [])),
+            "observations": list(state.get("observations", [])),
+            "action_history": list(state.get("action_history", [])),
+            "attempted_entrypoints": list(state.get("attempted_entrypoints", [])),
+            "remaining_actions": max(0, max_actions - state.get("iteration", 0)),
+            "strict_evidence": list(state.get("strict_evidence", [])),
+            "fallback_evidence": list(state.get("fallback_evidence", [])),
+            "current_action": state.get("current_action")
+            or FlightSearchActionDecision(
+                action="search_primary",
+                reason="initial deterministic fast path",
+            ).model_dump(),
+            "human_interrupt_count": state.get("human_interrupt_count", 0),
+            "termination_reason": None,
+        }
+
+    def execute_action(state: ReactFlightSearchState) -> ReactFlightSearchState:
+        decision = FlightSearchActionDecision.model_validate(state["current_action"])
         iteration = state.get("iteration", 0) + 1
-        max_iters = state.get("max_iterations", max_iterations)
-        query = _build_search_query(state["intent"], iteration)
-        progress.emit(f"生成机票搜索计划，第 {iteration}/{max_iters} 轮...")
+        max_actions = state.get("max_iterations", max_iterations)
+        entrypoint = _entrypoint_for_action(decision.action, state.get("_last_entrypoint"))
+        action_id = f"action-{iteration}"
+        query = _build_search_query(state["intent"], iteration, decision.action)
+        progress.emit(f"执行机票搜索动作 {iteration}/{max_actions}: {decision.action} ({entrypoint})")
+        progress.emit(f"搜索公开机票页面: {query}")
+        warnings = list(state.get("warnings", []))
+        raw_results = list(state.get("raw_results", []))
+        extracted_evidence = list(state.get("extracted_evidence", []))
+        strict_evidence = list(state.get("strict_evidence", []))
+        fallback_evidence = list(state.get("fallback_evidence", []))
+        status = "no_results"
+        warning: str | None = None
+        attempt_evidence: list[FlightEvidence] = []
+        try:
+            query_results = web_search.search(query)
+            if not query_results:
+                warning = f"web_search_no_results:{query}"
+                warnings.append(warning)
+            raw_results.extend(query_results)
+        except Exception as exc:
+            status = "tool_error"
+            warning = f"web_search_failed:{exc}"
+            warnings.append(warning)
+            query_results = []
+
+        intent = state["intent"]
+        for result in query_results:
+            try:
+                attempt = _extract_page_attempt(
+                    page_extractor,
+                    result.url,
+                    entrypoint=entrypoint,
+                    action_id=action_id,
+                    force_refresh=decision.action == "refresh_capture",
+                )
+            except Exception as exc:
+                status = _status_from_exception(exc)
+                warning = f"page_extract_failed:{result.url}:{exc}"
+                warnings.append(warning)
+                continue
+            status = attempt.status
+            if attempt.warning:
+                warning = attempt.warning
+                warnings.append(f"page_extract_{attempt.status}:{result.url}:{attempt.warning}")
+            if not attempt.evidence and attempt.status == "no_evidence":
+                warnings.append(f"page_extract_no_evidence:{result.url}")
+            attempt_evidence.extend(_normalise_extracted_evidence(attempt.evidence, result, intent))
+
+        hard_matches = [
+            item for item in attempt_evidence if _matches_intent_without_time_preference(item, intent)
+        ]
+        strict_matches = [item for item in hard_matches if _matches_intent(item, intent)]
+        if strict_matches:
+            status = "success"
+        elif hard_matches and intent.time_preference:
+            status = "time_preference_mismatch"
+        elif attempt_evidence:
+            status = "hard_constraint_mismatch"
+        extracted_evidence.extend(attempt_evidence)
+        fallback_evidence.extend(item for item in hard_matches if item not in fallback_evidence)
+        strict_evidence.extend(item for item in strict_matches if item not in strict_evidence)
+
+        observation = FlightSearchObservation(
+            action_id=action_id,
+            action=decision.action,
+            entrypoint=entrypoint,
+            status=status,
+            evidence_count=len(attempt_evidence),
+            strict_match_count=len(strict_matches),
+            fallback_match_count=len(hard_matches),
+            warning=warning,
+        )
+        action_record = {
+            "action_id": action_id,
+            "action": decision.action,
+            "entrypoint": entrypoint,
+            "status": status,
+            "reason": decision.reason,
+        }
+        attempted_entrypoints = list(state.get("attempted_entrypoints", []))
+        if entrypoint not in attempted_entrypoints:
+            attempted_entrypoints.append(entrypoint)
+
         return {
             **state,
             "iteration": iteration,
-            "max_iterations": max_iters,
             "current_query": query,
             "search_queries": state.get("search_queries", []) + [query],
-        }
-
-    def run_web_search(state: ReactFlightSearchState) -> ReactFlightSearchState:
-        progress.emit(f"搜索公开机票页面: {state['current_query']}")
-        warnings = list(state.get("warnings", []))
-        raw_results = list(state.get("raw_results", []))
-        try:
-            query_results = web_search.search(state["current_query"])
-            if not query_results:
-                warnings.append(f"web_search_no_results:{state['current_query']}")
-            raw_results.extend(query_results)
-        except Exception as exc:
-            warnings.append(f"web_search_failed:{exc}")
-        return {**state, "raw_results": _dedupe_results(raw_results), "warnings": warnings}
-
-    def extract_pages(state: ReactFlightSearchState) -> ReactFlightSearchState:
-        progress.emit("抽取机票页面价格信息...")
-        warnings = list(state.get("warnings", []))
-        evidence = list(state.get("extracted_evidence", []))
-        seen_urls = set(state.get("_extracted_urls", []))
-        intent = state["intent"]
-
-        for result in state.get("raw_results", []):
-            if result.url in seen_urls:
-                continue
-            seen_urls.add(result.url)
-            try:
-                extracted = page_extractor.extract(result.url)
-            except Exception as exc:
-                warnings.append(f"page_extract_failed:{result.url}:{exc}")
-                continue
-            if not extracted:
-                warnings.append(f"page_extract_no_evidence:{result.url}")
-            evidence.extend(_normalise_extracted_evidence(extracted, result, intent))
-
-        return {
-            **state,
-            "extracted_evidence": evidence,
-            "_extracted_urls": list(seen_urls),
+            "raw_results": _dedupe_results(raw_results),
+            "extracted_evidence": extracted_evidence,
+            "strict_evidence": strict_evidence,
+            "fallback_evidence": fallback_evidence,
+            "observations": state.get("observations", []) + [observation.model_dump(mode="json")],
+            "action_history": state.get("action_history", []) + [action_record],
+            "attempted_entrypoints": attempted_entrypoints,
+            "remaining_actions": max(0, max_actions - iteration),
+            "_last_entrypoint": entrypoint,
+            "_last_status": status,
+            "_last_warning": warning,
             "warnings": warnings,
         }
 
-    def judge_evidence(state: ReactFlightSearchState) -> ReactFlightSearchState:
-        progress.emit("判断机票证据是否匹配...")
+    def judge_and_verify(state: ReactFlightSearchState) -> ReactFlightSearchState:
+        progress.emit("判断并验证机票证据...")
+        strict_evidence = state.get("strict_evidence", [])
         if evidence_judge is None:
-            return {**state, "judged_evidence": state.get("extracted_evidence", [])}
-
-        warnings = list(state.get("warnings", []))
-        judged: list[FlightEvidence] = []
-        intent = state["intent"]
-        evidence_by_url: dict[str, list[FlightEvidence]] = defaultdict(list)
-        for item in state.get("extracted_evidence", []):
-            evidence_by_url[item.url].append(item)
-
-        result_by_url = {result.url: result for result in state.get("raw_results", [])}
-        for url, url_evidence in evidence_by_url.items():
-            search_result = result_by_url.get(
-                url,
-                SearchResult(title="", url=url, snippet="", source_name=urllib.parse.urlparse(url).netloc or "web"),
+            judged = strict_evidence
+            warnings = list(state.get("warnings", []))
+        else:
+            judged, warnings = _judge_evidence_by_url(
+                evidence_judge,
+                state["intent"],
+                state.get("raw_results", []),
+                strict_evidence,
+                state.get("warnings", []),
             )
-            try:
-                judged.extend(
-                    evidence_judge.judge(
-                        intent=intent,
-                        search_result=search_result,
-                        evidence=url_evidence,
+        options = evidence_verifier.verify(judged, state["intent"])
+        return {
+            **state,
+            "judged_evidence": judged,
+            "verified_flight_options": options,
+            "warnings": warnings,
+            "termination_reason": "verified" if options else state.get("termination_reason"),
+        }
+
+    def plan_next_action(state: ReactFlightSearchState) -> ReactFlightSearchState:
+        remaining = state.get("remaining_actions", 0)
+        fallback_available = bool(state.get("fallback_evidence")) and bool(state["intent"].time_preference)
+        if remaining <= 0:
+            decision = FlightSearchActionDecision(
+                action="relax_time_preference" if fallback_available else "stop",
+                reason="page action budget exhausted",
+            )
+        else:
+            observation = FlightSearchObservation.model_validate(state["observations"][-1])
+            if action_planner is not None:
+                try:
+                    proposed = action_planner.plan(
+                        intent=state["intent"],
+                        observation=observation,
+                        action_history=state.get("action_history", []),
+                        remaining_actions=remaining,
                     )
-                )
-            except Exception as exc:
-                warnings.append(f"llm_evidence_judge_failed:{url}:{exc}")
+                except Exception as exc:
+                    proposed = _deterministic_next_action(state, observation)
+                    proposed = proposed.model_copy(
+                        update={"reason": f"action planner failed; {proposed.reason}: {exc}"}
+                    )
+            else:
+                proposed = _deterministic_next_action(state, observation)
+            decision = _validate_action_decision(proposed, state)
+        return {**state, "current_action": decision.model_dump()}
 
-        return {**state, "judged_evidence": judged, "warnings": warnings}
+    def interrupt_for_human(state: ReactFlightSearchState) -> ReactFlightSearchState:
+        resumed = interrupt(
+            {
+                "kind": "ctrip_manual_verification",
+                "origin": state["intent"].origin,
+                "destination": state["intent"].destination,
+                "message": "Complete Ctrip verification in the open browser, then resume.",
+            }
+        )
+        if not resumed:
+            return {
+                **state,
+                "current_action": FlightSearchActionDecision(
+                    action="stop",
+                    reason="manual verification was not completed",
+                ).model_dump(),
+                "termination_reason": "human_verification_declined",
+            }
+        return {
+            **state,
+            "human_interrupt_count": state.get("human_interrupt_count", 0) + 1,
+            "current_action": FlightSearchActionDecision(
+                action="refresh_capture",
+                reason="resume after manual verification",
+            ).model_dump(),
+        }
 
-    def verify_options(state: ReactFlightSearchState) -> ReactFlightSearchState:
-        progress.emit("聚合可用机票候选...")
-        evidence = state.get("judged_evidence", state.get("extracted_evidence", []))
-        options = evidence_verifier.verify(evidence, state["intent"])
+    def accept_fallback(state: ReactFlightSearchState) -> ReactFlightSearchState:
+        intent = state["intent"]
+        relaxed_intent = replace(intent, time_preference=None)
+        evidence = state.get("fallback_evidence", [])
+        if evidence_judge is None:
+            judged = evidence
+            warnings = list(state.get("warnings", []))
+        else:
+            judged, warnings = _judge_evidence_by_url(
+                evidence_judge,
+                relaxed_intent,
+                state.get("raw_results", []),
+                evidence,
+                state.get("warnings", []),
+            )
+        marker = f"time_preference_not_met:{intent.time_preference}"
+        options = [
+            replace(option, warnings=[*option.warnings, marker])
+            for option in evidence_verifier.verify(judged, relaxed_intent)
+        ]
+        if marker not in warnings:
+            warnings.append(marker)
+        return {
+            **state,
+            "judged_evidence": judged,
+            "verified_flight_options": options,
+            "warnings": warnings,
+            "termination_reason": "time_preference_fallback" if options else "insufficient_evidence",
+        }
+
+    def finish_failure(state: ReactFlightSearchState) -> ReactFlightSearchState:
         warnings = list(state.get("warnings", []))
-        if not options and state.get("iteration", 0) >= state.get("max_iterations", max_iterations):
-            if (
-                state["intent"].time_preference
-                and any(_matches_intent_without_time_preference(item, state["intent"]) for item in evidence)
-            ):
-                warnings.append(
-                    f"no_flight_options_match_time_preference:{state['intent'].time_preference}"
-                )
+        if "insufficient_verified_flight_evidence" not in warnings:
             warnings.append("insufficient_verified_flight_evidence")
-        return {**state, "verified_flight_options": options, "warnings": warnings}
+        return {
+            **state,
+            "verified_flight_options": [],
+            "warnings": warnings,
+            "termination_reason": state.get("termination_reason") or "insufficient_evidence",
+        }
 
-    def should_continue(state: ReactFlightSearchState) -> str:
-        if state.get("verified_flight_options"):
-            return "done"
-        if state.get("iteration", 0) >= state.get("max_iterations", max_iterations):
-            return "done"
-        return "continue"
+    def after_execute(state: ReactFlightSearchState) -> str:
+        if state.get("_last_status") == "captcha_required":
+            return "human"
+        if state.get("strict_evidence"):
+            return "judge"
+        return "plan"
 
-    graph.add_node("generate_search_plan", generate_search_plan)
-    graph.add_node("web_search", run_web_search)
-    graph.add_node("extract_pages", extract_pages)
-    graph.add_node("judge_evidence", judge_evidence)
-    graph.add_node("verify_options", verify_options)
+    def after_judge(state: ReactFlightSearchState) -> str:
+        return "done" if state.get("verified_flight_options") else "plan"
 
-    graph.add_edge(START, "generate_search_plan")
-    graph.add_edge("generate_search_plan", "web_search")
-    graph.add_edge("web_search", "extract_pages")
-    graph.add_edge("extract_pages", "judge_evidence")
-    graph.add_edge("judge_evidence", "verify_options")
+    def route_action(state: ReactFlightSearchState) -> str:
+        action = FlightSearchActionDecision.model_validate(state["current_action"]).action
+        if action == "await_human_verification":
+            return "human"
+        if action == "relax_time_preference":
+            return "fallback"
+        if action in {"finish", "stop"}:
+            return "fail"
+        return "execute"
+
+    def after_human(state: ReactFlightSearchState) -> str:
+        action = FlightSearchActionDecision.model_validate(state["current_action"]).action
+        return "fail" if action == "stop" else "execute"
+
+    graph.add_node("initialize_search", initialize_search)
+    graph.add_node("execute_action", execute_action)
+    graph.add_node("judge_and_verify", judge_and_verify)
+    graph.add_node("plan_next_action", plan_next_action)
+    graph.add_node("interrupt_for_human", interrupt_for_human)
+    graph.add_node("accept_fallback", accept_fallback)
+    graph.add_node("finish_failure", finish_failure)
+
+    graph.add_edge(START, "initialize_search")
+    graph.add_edge("initialize_search", "execute_action")
     graph.add_conditional_edges(
-        "verify_options",
-        should_continue,
-        {"continue": "generate_search_plan", "done": END},
+        "execute_action",
+        after_execute,
+        {"human": "interrupt_for_human", "judge": "judge_and_verify", "plan": "plan_next_action"},
+    )
+    graph.add_conditional_edges(
+        "judge_and_verify",
+        after_judge,
+        {"done": END, "plan": "plan_next_action"},
+    )
+    graph.add_conditional_edges(
+        "plan_next_action",
+        route_action,
+        {
+            "human": "interrupt_for_human",
+            "fallback": "accept_fallback",
+            "fail": "finish_failure",
+            "execute": "execute_action",
+        },
+    )
+    graph.add_conditional_edges(
+        "interrupt_for_human",
+        after_human,
+        {"execute": "execute_action", "fail": "finish_failure"},
+    )
+    graph.add_edge("accept_fallback", END)
+    graph.add_edge("finish_failure", END)
+
+    return CompiledReactFlightSearchGraph(graph.compile(checkpointer=InMemorySaver()))
+
+
+def invoke_react_flight_search(
+    graph,
+    state: dict[str, object],
+    *,
+    human_verification_handler: Callable[[dict[str, object]], bool] | None = None,
+    thread_id: str | None = None,
+) -> dict[str, object]:
+    config = {"configurable": {"thread_id": thread_id or f"flight-{uuid.uuid4().hex}"}}
+    result = graph.invoke(state, config=config)
+    while result.get("__interrupt__"):
+        payload = _interrupt_payload(result)
+        resumed = bool(human_verification_handler and human_verification_handler(payload))
+        result = graph.invoke(Command(resume=resumed), config=config)
+    return result
+
+
+def _interrupt_payload(state: dict[str, object]) -> dict[str, object]:
+    interrupts = state.get("__interrupt__") or []
+    if not interrupts:
+        return {}
+    value = getattr(interrupts[0], "value", {})
+    return value if isinstance(value, dict) else {"message": str(value)}
+
+
+def _extract_page_attempt(
+    page_extractor: PageExtractor,
+    url: str,
+    *,
+    entrypoint: str,
+    action_id: str,
+    force_refresh: bool,
+) -> FlightPageAttemptResult:
+    adaptive_extract = getattr(page_extractor, "extract_attempt", None)
+    if callable(adaptive_extract):
+        return adaptive_extract(
+            url,
+            entrypoint=entrypoint,
+            action_id=action_id,
+            force_refresh=force_refresh,
+        )
+    evidence = page_extractor.extract(url)
+    return FlightPageAttemptResult(
+        status="success" if evidence else "no_evidence",
+        evidence=evidence,
+        entrypoint=entrypoint,
+        source_url=url,
     )
 
-    return graph.compile()
+
+def _judge_evidence_by_url(
+    evidence_judge: FlightEvidenceJudge,
+    intent: FlightSearchIntent,
+    raw_results: list[SearchResult],
+    evidence: list[FlightEvidence],
+    existing_warnings: list[str],
+) -> tuple[list[FlightEvidence], list[str]]:
+    warnings = list(existing_warnings)
+    judged: list[FlightEvidence] = []
+    evidence_by_url: dict[str, list[FlightEvidence]] = defaultdict(list)
+    for item in evidence:
+        evidence_by_url[item.url].append(item)
+    result_by_url = {result.url: result for result in raw_results}
+    for url, url_evidence in evidence_by_url.items():
+        search_result = result_by_url.get(
+            url,
+            SearchResult(
+                title="",
+                url=url,
+                snippet="",
+                source_name=urllib.parse.urlparse(url).netloc or "web",
+            ),
+        )
+        try:
+            judged.extend(
+                evidence_judge.judge(
+                    intent=intent,
+                    search_result=search_result,
+                    evidence=url_evidence,
+                )
+            )
+        except Exception as exc:
+            warnings.append(f"llm_evidence_judge_failed:{url}:{exc}")
+    return judged, warnings
 
 
-def _build_search_query(intent: FlightSearchIntent, iteration: int) -> str:
+def _entrypoint_for_action(action: FlightSearchAction, last_entrypoint: str | None) -> str:
+    return {
+        "search_primary": "international",
+        "search_secondary": "online_list",
+        "search_homepage": "homepage",
+        "refresh_capture": last_entrypoint or "international",
+    }.get(action, last_entrypoint or "international")
+
+
+def _status_from_exception(exc: Exception) -> str:
+    text = str(exc).casefold()
+    if "captcha" in text or "manual verification" in text or "security verification" in text:
+        return "captcha_required"
+    if "login" in text or "account" in text or "password" in text:
+        return "login_required"
+    if "payload" in text or "batchsearch" in text or "timed out" in text:
+        return "no_payload"
+    if isinstance(exc, (ValueError, KeyError, TypeError, json.JSONDecodeError)):
+        return "parse_failed"
+    return "tool_error"
+
+
+def _deterministic_next_action(
+    state: ReactFlightSearchState,
+    observation: FlightSearchObservation,
+) -> FlightSearchActionDecision:
+    if observation.status == "captcha_required":
+        return FlightSearchActionDecision(
+            action="await_human_verification",
+            reason="Ctrip requires manual verification",
+        )
+    attempted = set(state.get("attempted_entrypoints", []))
+    for action, entrypoint in (
+        ("search_secondary", "online_list"),
+        ("search_homepage", "homepage"),
+        ("search_primary", "international"),
+    ):
+        if entrypoint not in attempted:
+            return FlightSearchActionDecision(
+                action=action,
+                reason=f"try unvisited Ctrip entrypoint after {observation.status}",
+            )
+    if state.get("fallback_evidence") and state["intent"].time_preference:
+        return FlightSearchActionDecision(
+            action="relax_time_preference",
+            reason="strict time preference has no matching inventory",
+        )
+    refresh_count = sum(
+        item.get("action") == "refresh_capture" for item in state.get("action_history", [])
+    )
+    if refresh_count == 0:
+        return FlightSearchActionDecision(
+            action="refresh_capture",
+            reason="all entrypoints tried; perform one fresh capture",
+        )
+    return FlightSearchActionDecision(action="stop", reason="no recoverable action remains")
+
+
+def _validate_action_decision(
+    proposed: FlightSearchActionDecision,
+    state: ReactFlightSearchState,
+) -> FlightSearchActionDecision:
+    observation = FlightSearchObservation.model_validate(state["observations"][-1])
+    if observation.status == "captcha_required":
+        return FlightSearchActionDecision(
+            action="await_human_verification",
+            reason="policy requires human verification for captcha",
+        )
+    if proposed.action == "await_human_verification":
+        return _deterministic_next_action(state, observation)
+    if proposed.action == "relax_time_preference":
+        if state.get("fallback_evidence") and state["intent"].time_preference:
+            return proposed
+        return _deterministic_next_action(state, observation)
+    if proposed.action in {"search_primary", "search_secondary", "search_homepage"}:
+        entrypoint = _entrypoint_for_action(proposed.action, state.get("_last_entrypoint"))
+        if entrypoint in state.get("attempted_entrypoints", []):
+            return _deterministic_next_action(state, observation)
+    if proposed.action == "refresh_capture":
+        refresh_count = sum(
+            item.get("action") == "refresh_capture" for item in state.get("action_history", [])
+        )
+        if refresh_count >= 1:
+            return _deterministic_next_action(state, observation)
+    return proposed
+
+
+def _build_search_query(
+    intent: FlightSearchIntent,
+    iteration: int,
+    action: FlightSearchAction = "search_primary",
+) -> str:
     pieces = [
         intent.origin,
         intent.destination,
@@ -567,6 +1085,7 @@ def _build_search_query(intent: FlightSearchIntent, iteration: int) -> str:
             pieces.append(intent.time_preference)
     if iteration >= 3:
         pieces.extend(["cheap flights", "official", "booking"])
+    pieces.append(f"react_action={action}")
     return " ".join(piece for piece in pieces if piece)
 
 
@@ -628,6 +1147,31 @@ Reject hotel prices, ads, generic package prices, unrelated routes, wrong dates,
 Use the user's requested route/date when the page evidence is clearly about that same query.
 Return only structured decisions. Do not include hidden reasoning.
     """.strip()
+
+
+def _flight_action_planner_prompt() -> str:
+    return """
+You choose the next bounded browser action for one fixed flight route on Ctrip.
+
+You may choose only one of:
+- search_primary
+- search_secondary
+- search_homepage
+- refresh_capture
+- await_human_verification
+- relax_time_preference
+- finish
+- stop
+
+Rules:
+- Never change the origin, destination, travel date, currency, or route scope.
+- Use await_human_verification only when the observation reports a captcha.
+- Use relax_time_preference only when matching-route evidence exists but misses the requested time preference.
+- Prefer an untried entrypoint over repeating an entrypoint.
+- Use refresh_capture at most once and only after entrypoints have been tried or verification was resumed.
+- Stop when there is no useful recovery action.
+- Return a short operational reason. Do not return private chain-of-thought.
+""".strip()
 
 
 def _flight_evidence_batch_judge_prompt() -> str:

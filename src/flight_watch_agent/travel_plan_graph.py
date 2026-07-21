@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 import json
 from concurrent.futures import ThreadPoolExecutor
@@ -26,12 +26,14 @@ from .agent_nodes import (
     select_strategies as select_agent_strategies,
 )
 from .flight_react import (
+    FlightActionPlanner,
     FlightEvidenceJudge,
     FlightEvidenceJudgeRequest,
     FlightEvidenceVerifier,
     PageExtractor,
     WebSearchTool,
     build_react_flight_search_graph,
+    invoke_react_flight_search,
 )
 from .models import FlightOption, FlightSearchIntent, SearchResult, TrainOption
 from .places import (
@@ -156,12 +158,14 @@ def build_travel_plan_graph(
     page_extractor: PageExtractor,
     train_provider: TrainProvider | None = None,
     evidence_judge: FlightEvidenceJudge | None = None,
+    flight_action_planner: FlightActionPlanner | None = None,
     verifier: FlightEvidenceVerifier | None = None,
     route_planner: RoutePlanner | None = None,
     hub_planner: HubPlanner | None = None,
     hub_proposer: HubProposer | None = None,
     hub_endpoint_validator: HubEndpointValidator | None = None,
     progress_reporter: ProgressReporter | None = None,
+    human_verification_handler=None,
     transfer_hubs: list[str] | None = None,
 ):
     progress = get_progress_reporter(progress_reporter)
@@ -175,6 +179,7 @@ def build_travel_plan_graph(
         web_search=web_search,
         page_extractor=page_extractor,
         evidence_judge=None if batch_evidence_judge is not None else evidence_judge,
+        action_planner=flight_action_planner,
         verifier=evidence_verifier,
         progress_reporter=progress,
     )
@@ -183,6 +188,7 @@ def build_travel_plan_graph(
             web_search=web_search,
             page_extractor=page_extractor,
             evidence_judge=evidence_judge,
+            action_planner=flight_action_planner,
             verifier=evidence_verifier,
             progress_reporter=progress,
         )
@@ -210,7 +216,11 @@ def build_travel_plan_graph(
             return {}
         progress.emit("并行查询直达机票...")
         return {
-            "prefetched_direct_flight_state": react_search.invoke({"intent": state["intent"]})
+            "prefetched_direct_flight_state": invoke_react_flight_search(
+                react_search,
+                {"intent": state["intent"]},
+                human_verification_handler=human_verification_handler,
+            )
         }
 
     def generate_candidate_hubs(state: TravelPlanState) -> TravelPlanState:
@@ -427,7 +437,11 @@ def build_travel_plan_graph(
 
             react_state = flight_query_cache.get(cache_key)
             if react_state is None:
-                react_state = react_search.invoke({"intent": query_intent})
+                react_state = invoke_react_flight_search(
+                    react_search,
+                    {"intent": query_intent},
+                    human_verification_handler=human_verification_handler,
+                )
                 flight_query_cache[cache_key] = react_state
             else:
                 progress.emit(_progress_reuse_message(item))
@@ -440,6 +454,7 @@ def build_travel_plan_graph(
                 batch_evidence_judge,
                 evidence_verifier,
                 fallback_react_search,
+                human_verification_handler=human_verification_handler,
             )
             flight_evidence_llm_batches = int(
                 getattr(batch_evidence_judge, "last_batch_count", 0)
@@ -717,6 +732,12 @@ def _empty_flight_debug() -> dict[str, object]:
         "extracted_evidence": [],
         "judged_evidence": [],
         "verified_flight_options": [],
+        "observations": [],
+        "action_history": [],
+        "attempted_entrypoints": [],
+        "remaining_actions": 0,
+        "human_interrupt_count": 0,
+        "termination_reason": None,
         "warnings": [],
     }
 
@@ -729,8 +750,60 @@ def _react_debug(react_state: dict[str, object]) -> dict[str, object]:
         "extracted_evidence": react_state.get("extracted_evidence", []),
         "judged_evidence": react_state.get("judged_evidence", []),
         "verified_flight_options": react_state.get("verified_flight_options", []),
+        "observations": react_state.get("observations", []),
+        "action_history": react_state.get("action_history", []),
+        "attempted_entrypoints": react_state.get("attempted_entrypoints", []),
+        "remaining_actions": react_state.get("remaining_actions", 0),
+        "human_interrupt_count": react_state.get("human_interrupt_count", 0),
+        "termination_reason": react_state.get("termination_reason"),
         "warnings": react_state.get("warnings", []),
     }
+
+
+def _react_recovery_state(react_state: dict[str, object]) -> dict[str, object]:
+    attempted = set(react_state.get("attempted_entrypoints", []))
+    if "online_list" not in attempted:
+        next_action = "search_secondary"
+    elif "homepage" not in attempted:
+        next_action = "search_homepage"
+    else:
+        next_action = "refresh_capture"
+    return {
+        **react_state,
+        "judged_evidence": [],
+        "verified_flight_options": [],
+        "strict_evidence": [],
+        "fallback_evidence": [],
+        "current_action": {
+            "action": next_action,
+            "reason": "continue after batch evidence rejection",
+        },
+        "termination_reason": None,
+    }
+
+
+def _invoke_react_recovery(
+    graph,
+    react_state: dict[str, object],
+    *,
+    human_verification_handler=None,
+) -> dict[str, object]:
+    if int(react_state.get("remaining_actions", 0) or 0) <= 0:
+        warnings = list(react_state.get("warnings", []))
+        if "insufficient_verified_flight_evidence" not in warnings:
+            warnings.append("insufficient_verified_flight_evidence")
+        return {
+            **react_state,
+            "judged_evidence": [],
+            "verified_flight_options": [],
+            "warnings": warnings,
+            "termination_reason": "batch_rejected_action_budget_exhausted",
+        }
+    return invoke_react_flight_search(
+        graph,
+        _react_recovery_state(react_state),
+        human_verification_handler=human_verification_handler,
+    )
 
 
 def _append_transfer_debug(
@@ -803,6 +876,8 @@ def _batch_judge_flight_searches(
     evidence_judge,
     verifier: FlightEvidenceVerifier,
     fallback_react_search,
+    *,
+    human_verification_handler=None,
 ) -> dict[tuple[object, ...], dict]:
     requests: list[FlightEvidenceJudgeRequest] = []
     request_keys: dict[str, tuple[object, ...]] = {}
@@ -821,7 +896,7 @@ def _batch_judge_flight_searches(
             requests.append(
                 FlightEvidenceJudgeRequest(
                     request_id=request_id,
-                    intent=react_state["intent"],
+                    intent=_verification_intent_for_react_state(react_state),
                     search_result=result_by_url.get(
                         url,
                         SearchResult(
@@ -839,7 +914,11 @@ def _batch_judge_flight_searches(
         judged_by_request = evidence_judge.judge_many(requests)
     except Exception:
         return {
-            cache_key: fallback_react_search.invoke({"intent": react_state["intent"]})
+            cache_key: _invoke_react_recovery(
+                fallback_react_search,
+                react_state,
+                human_verification_handler=human_verification_handler,
+            )
             for cache_key, react_state in search_cache.items()
         }
 
@@ -852,9 +931,20 @@ def _batch_judge_flight_searches(
     updated: dict[tuple[object, ...], dict] = {}
     for cache_key, react_state in search_cache.items():
         judged_evidence = judged_by_query.get(cache_key, [])
-        options = verifier.verify(judged_evidence, react_state["intent"])
+        verification_intent = _verification_intent_for_react_state(react_state)
+        options = verifier.verify(judged_evidence, verification_intent)
+        if react_state.get("termination_reason") == "time_preference_fallback":
+            marker = f"time_preference_not_met:{react_state['intent'].time_preference}"
+            options = [
+                replace(option, warnings=[*option.warnings, marker])
+                for option in options
+            ]
         if react_state.get("extracted_evidence") and not options:
-            updated[cache_key] = fallback_react_search.invoke({"intent": react_state["intent"]})
+            updated[cache_key] = _invoke_react_recovery(
+                fallback_react_search,
+                react_state,
+                human_verification_handler=human_verification_handler,
+            )
             continue
         updated[cache_key] = {
             **react_state,
@@ -862,6 +952,13 @@ def _batch_judge_flight_searches(
             "verified_flight_options": options,
         }
     return updated
+
+
+def _verification_intent_for_react_state(react_state: dict[str, object]) -> FlightSearchIntent:
+    intent = react_state["intent"]
+    if react_state.get("termination_reason") == "time_preference_fallback":
+        return replace(intent, time_preference=None)
+    return intent
 
 
 def _train_edges_from_options(

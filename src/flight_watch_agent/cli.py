@@ -12,6 +12,7 @@ from .app import (
     build_default_travel_plan_agent,
 )
 from .models import FlightSearchIntent
+from .flight_react import invoke_react_flight_search
 from .progress import ConsoleProgressReporter, NoopProgressReporter
 
 
@@ -40,7 +41,7 @@ def main(argv: list[str] | None = None) -> None:
         help="Debug only the public-page flight search pipeline.",
     )
     _add_flight_intent_arguments(debug_parser)
-    debug_parser.add_argument("--max-iterations", type=int, default=3)
+    debug_parser.add_argument("--max-iterations", type=int, default=4)
     debug_parser.add_argument("--no-llm-judge", action="store_true", help="Skip LLM evidence judging.")
 
     args = parser.parse_args(argv)
@@ -49,6 +50,7 @@ def main(argv: list[str] | None = None) -> None:
             llm_model=args.model,
             include_train=not args.flight_only,
             progress_reporter=_progress_reporter_from_args(args),
+            human_verification_handler=_console_human_verification,
         )
         state = graph.invoke({"user_input": " ".join(args.text)})
         print(state["response"])
@@ -57,7 +59,10 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     if args.command == "plan-flight":
-        graph = build_default_travel_plan_agent(progress_reporter=_progress_reporter_from_args(args))
+        graph = build_default_travel_plan_agent(
+            progress_reporter=_progress_reporter_from_args(args),
+            human_verification_handler=_console_human_verification,
+        )
         state = graph.invoke(
             {
                 "intent": _flight_search_intent_from_args(args)
@@ -73,7 +78,11 @@ def main(argv: list[str] | None = None) -> None:
             use_llm_judge=not args.no_llm_judge,
             max_iterations=args.max_iterations,
         )
-        state = graph.invoke({"intent": _flight_search_intent_from_args(args)})
+        state = invoke_react_flight_search(
+            graph,
+            {"intent": _flight_search_intent_from_args(args)},
+            human_verification_handler=_console_human_verification,
+        )
         print(_format_react_flight_raw_output(state))
         return
 
@@ -142,6 +151,18 @@ def _configure_stdio() -> None:
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
+
+
+def _console_human_verification(payload: dict[str, object]) -> bool:
+    if not sys.stdin.isatty():
+        return False
+    message = str(payload.get("message") or "Complete verification in the browser.")
+    print(f"[需要人工验证] {message}", file=sys.stderr)
+    try:
+        answer = input("完成后按 Enter 继续，输入 q 取消: ")
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return answer.strip().casefold() != "q"
 
 
 if __name__ == "__main__":

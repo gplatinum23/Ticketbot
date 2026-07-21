@@ -11,12 +11,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .models import FlightEvidence, FlightSearchIntent, SearchResult
+from .models import FlightEvidence, FlightPageAttemptResult, FlightSearchIntent, SearchResult
 
 
 CTRIP_SCHEME = "ctrip-selenium"
 DEFAULT_CTRIP_COOKIES_FILE = "data/ctrip_cookies.json"
 REQUIRED_CTRIP_COOKIES = ["AHeadUserInfo", "DUID", "IsNonUser", "_udl", "cticket", "login_type", "login_uid"]
+
+
+class CtripManualVerificationRequired(RuntimeError):
+    pass
 
 
 class CtripRouteSearchTool:
@@ -208,6 +212,103 @@ class CtripSeleniumWirePageExtractor:
             elif not self._driver_ready:
                 self.close()
 
+    def extract_attempt(
+        self,
+        url: str,
+        *,
+        entrypoint: str,
+        action_id: str,
+        force_refresh: bool = False,
+    ) -> FlightPageAttemptResult:
+        del action_id
+        intent = parse_ctrip_selenium_url(url)
+        driver, is_new_driver = self._acquire_driver()
+        source_url: str | None = None
+        try:
+            if self.login_allowed and (is_new_driver or not self._driver_ready):
+                _CtripLoginSession(
+                    accounts=self.accounts,
+                    passwords=self.passwords,
+                    cookies_file=self.cookies_file,
+                    timeout_seconds=self.timeout_seconds,
+                    login_wait_seconds=self.login_wait_seconds,
+                ).ensure_login(driver)
+            if self.reuse_browser_session:
+                self._driver_ready = True
+            try:
+                del driver.requests
+            except AttributeError:
+                pass
+
+            search_urls = _build_ctrip_search_urls(intent)
+            if entrypoint == "international":
+                source_url = search_urls[0]
+                driver.get(source_url)
+            elif entrypoint == "online_list":
+                source_url = search_urls[1]
+                driver.get(source_url)
+            elif entrypoint == "homepage":
+                source_url = "https://flights.ctrip.com/online/channel/domestic"
+                _drive_ctrip_homepage_search(driver, intent, timeout_seconds=self.timeout_seconds)
+            else:
+                return FlightPageAttemptResult(
+                    status="tool_error",
+                    evidence=[],
+                    entrypoint=entrypoint,
+                    warning=f"unsupported Ctrip entrypoint: {entrypoint}",
+                )
+
+            if force_refresh and entrypoint != "homepage":
+                driver.refresh()
+            payload = _wait_for_ctrip_search_payload(
+                driver,
+                timeout_seconds=self.timeout_seconds,
+                manual_verification_wait_seconds=0,
+            )
+            evidence = parse_ctrip_batch_search_payload(
+                payload,
+                intent,
+                source_url=source_url,
+                direct_only=self.direct_only,
+                max_results=self.max_results,
+            )
+            if not evidence:
+                return FlightPageAttemptResult(
+                    status="no_evidence",
+                    evidence=[],
+                    entrypoint=entrypoint,
+                    source_url=source_url,
+                    warning="batchSearch returned no parsable itineraries",
+                )
+            status = "success" if _evidence_satisfies_requested_time(evidence, intent) else "time_preference_mismatch"
+            return FlightPageAttemptResult(
+                status=status,
+                evidence=evidence,
+                entrypoint=entrypoint,
+                source_url=source_url,
+            )
+        except CtripManualVerificationRequired as exc:
+            return FlightPageAttemptResult(
+                status="captcha_required",
+                evidence=[],
+                entrypoint=entrypoint,
+                source_url=source_url,
+                warning=str(exc),
+            )
+        except Exception as exc:
+            return FlightPageAttemptResult(
+                status=_ctrip_attempt_status(exc),
+                evidence=[],
+                entrypoint=entrypoint,
+                source_url=source_url,
+                warning=f"{type(exc).__name__}:{str(exc).split('Stacktrace:')[0]}",
+            )
+        finally:
+            if not self.reuse_browser_session:
+                driver.quit()
+            elif not self._driver_ready:
+                self.close()
+
 
 def build_ctrip_selenium_url(intent: FlightSearchIntent) -> str:
     params = {
@@ -250,8 +351,11 @@ def _wait_for_ctrip_search_payload(
     timeout_seconds: int,
     manual_verification_wait_seconds: int,
 ) -> dict[str, Any]:
-    if _is_manual_verification_present(driver) and manual_verification_wait_seconds > 0:
-        _wait_for_manual_verification(driver, manual_verification_wait_seconds)
+    if _is_manual_verification_present(driver):
+        if manual_verification_wait_seconds > 0:
+            _wait_for_manual_verification(driver, manual_verification_wait_seconds)
+        else:
+            raise CtripManualVerificationRequired("Ctrip manual verification is required.")
 
     try:
         request = driver.wait_for_request(
@@ -284,6 +388,17 @@ def _wait_for_ctrip_search_payload(
     if request.response is None:
         raise RuntimeError("batchSearch request had no response body after manual verification.")
     return decode_ctrip_response_body(request.response.body)
+
+
+def _ctrip_attempt_status(exc: Exception) -> str:
+    text = str(exc).casefold()
+    if "login" in text or "account" in text or "password" in text:
+        return "login_required"
+    if "payload" in text or "batchsearch" in text or "timed out" in text:
+        return "no_payload"
+    if isinstance(exc, (ValueError, KeyError, TypeError, json.JSONDecodeError)):
+        return "parse_failed"
+    return "tool_error"
 
 
 def _retry_after_manual_verification_if_present(

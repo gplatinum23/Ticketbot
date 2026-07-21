@@ -9,13 +9,20 @@ from flight_watch_agent.flight_react import (
     FlightEvidenceDecisionBatch,
     FlightEvidenceJudgeRequest,
     FlightEvidenceVerifier,
+    FlightSearchActionDecision,
     FlightResponseDecision,
     FlightResponseDecisionBatch,
     LlmFlightEvidenceJudge,
     SkyscannerRouteSearchTool,
     build_react_flight_search_graph,
+    invoke_react_flight_search,
 )
-from flight_watch_agent.models import FlightEvidence, FlightSearchIntent, SearchResult
+from flight_watch_agent.models import (
+    FlightEvidence,
+    FlightPageAttemptResult,
+    FlightSearchIntent,
+    SearchResult,
+)
 from flight_watch_agent.models import TrainOption
 from flight_watch_agent.travel_plan_graph import build_travel_plan_graph
 
@@ -53,6 +60,35 @@ class FakeEvidenceJudge:
         if search_result.url not in self.accepted_urls:
             return []
         return evidence
+
+
+class FakeActionPlanner:
+    def __init__(self, decisions: list[FlightSearchActionDecision]) -> None:
+        self.decisions = decisions
+        self.calls = []
+
+    def plan(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.decisions:
+            return self.decisions.pop(0)
+        return FlightSearchActionDecision(action="stop", reason="no decision")
+
+
+class FakeAdaptiveExtractor:
+    def __init__(self, attempts: list[FlightPageAttemptResult]) -> None:
+        self.attempts = attempts
+        self.calls = []
+
+    def extract_attempt(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        if self.attempts:
+            return self.attempts.pop(0)
+        return FlightPageAttemptResult(
+            status="no_evidence",
+            evidence=[],
+            entrypoint=kwargs["entrypoint"],
+            source_url=url,
+        )
 
 
 class FakeStructuredLlm:
@@ -226,7 +262,7 @@ def test_react_search_stops_after_single_source_is_found():
     assert state["verified_flight_options"][0].evidence_count == 1
 
 
-def test_react_search_stops_after_three_iterations_without_verified_option():
+def test_react_search_stops_after_four_actions_without_verified_option():
     intent = _intent()
     only = _result("ota-a", "https://a.example/flight")
     search = FakeSearchTool([[only], [], []])
@@ -235,7 +271,9 @@ def test_react_search_stops_after_three_iterations_without_verified_option():
 
     state = graph.invoke({"intent": intent})
 
-    assert len(search.queries) == 3
+    assert len(search.queries) == 4
+    assert state["remaining_actions"] == 0
+    assert state["termination_reason"] == "insufficient_evidence"
     assert state["verified_flight_options"] == []
     assert "insufficient_verified_flight_evidence" in state["warnings"]
 
@@ -248,7 +286,7 @@ def test_react_search_warns_when_web_search_returns_no_results():
 
     state = graph.invoke({"intent": _intent()})
 
-    assert len([warning for warning in state["warnings"] if warning.startswith("web_search_no_results:")]) == 3
+    assert len([warning for warning in state["warnings"] if warning.startswith("web_search_no_results:")]) == 4
     assert "insufficient_verified_flight_evidence" in state["warnings"]
 
 
@@ -287,8 +325,196 @@ def test_react_search_warns_when_evidence_misses_time_preference():
 
     state = graph.invoke({"intent": _intent()})
 
-    assert "no_flight_options_match_time_preference:morning" in state["warnings"]
-    assert "insufficient_verified_flight_evidence" in state["warnings"]
+    assert "time_preference_not_met:morning" in state["warnings"]
+    assert len(state["verified_flight_options"]) == 1
+    assert state["verified_flight_options"][0].warnings == ["time_preference_not_met:morning"]
+
+
+def test_react_fast_path_does_not_call_action_planner():
+    result = _result("flights.ctrip.com", "https://example.com/flight")
+    planner = FakeActionPlanner([])
+    graph = build_react_flight_search_graph(
+        web_search=FakeSearchTool([[result]]),
+        page_extractor=FakeAdaptiveExtractor(
+            [
+                FlightPageAttemptResult(
+                    status="success",
+                    evidence=[_evidence("flights.ctrip.com", result.url, 800)],
+                    entrypoint="international",
+                    source_url=result.url,
+                )
+            ]
+        ),
+        action_planner=planner,
+    )
+
+    state = graph.invoke({"intent": _intent()})
+
+    assert planner.calls == []
+    assert state["iteration"] == 1
+    assert state["termination_reason"] == "verified"
+
+
+def test_react_action_planner_switches_to_secondary_entrypoint():
+    result = _result("flights.ctrip.com", "https://example.com/flight")
+    planner = FakeActionPlanner(
+        [FlightSearchActionDecision(action="search_secondary", reason="try backup")]
+    )
+    extractor = FakeAdaptiveExtractor(
+        [
+            FlightPageAttemptResult(
+                status="no_payload",
+                evidence=[],
+                entrypoint="international",
+                source_url=result.url,
+            ),
+            FlightPageAttemptResult(
+                status="success",
+                evidence=[_evidence("flights.ctrip.com", result.url, 820)],
+                entrypoint="online_list",
+                source_url=result.url,
+            ),
+        ]
+    )
+    graph = build_react_flight_search_graph(
+        web_search=FakeSearchTool([[result], [result]]),
+        page_extractor=extractor,
+        action_planner=planner,
+    )
+
+    state = graph.invoke({"intent": _intent()})
+
+    assert len(planner.calls) == 1
+    assert [call[1]["entrypoint"] for call in extractor.calls] == ["international", "online_list"]
+    assert [item["action"] for item in state["action_history"]] == [
+        "search_primary",
+        "search_secondary",
+    ]
+    assert state["verified_flight_options"][0].price == 820
+
+
+def test_react_policy_replaces_repeated_entrypoint_action():
+    result = _result("flights.ctrip.com", "https://example.com/flight")
+    planner = FakeActionPlanner(
+        [FlightSearchActionDecision(action="search_primary", reason="repeat")]
+    )
+    extractor = FakeAdaptiveExtractor(
+        [
+            FlightPageAttemptResult(
+                status="no_payload",
+                evidence=[],
+                entrypoint="international",
+                source_url=result.url,
+            ),
+            FlightPageAttemptResult(
+                status="success",
+                evidence=[_evidence("flights.ctrip.com", result.url, 830)],
+                entrypoint="online_list",
+                source_url=result.url,
+            ),
+        ]
+    )
+    graph = build_react_flight_search_graph(
+        web_search=FakeSearchTool([[result], [result]]),
+        page_extractor=extractor,
+        action_planner=planner,
+    )
+
+    state = graph.invoke({"intent": _intent()})
+
+    assert state["action_history"][1]["action"] == "search_secondary"
+    assert state["verified_flight_options"]
+
+
+def test_react_interrupt_resumes_without_consuming_a_separate_action():
+    result = _result("flights.ctrip.com", "https://example.com/flight")
+    extractor = FakeAdaptiveExtractor(
+        [
+            FlightPageAttemptResult(
+                status="captcha_required",
+                evidence=[],
+                entrypoint="international",
+                source_url=result.url,
+            ),
+            FlightPageAttemptResult(
+                status="success",
+                evidence=[_evidence("flights.ctrip.com", result.url, 840)],
+                entrypoint="international",
+                source_url=result.url,
+            ),
+        ]
+    )
+    graph = build_react_flight_search_graph(
+        web_search=FakeSearchTool([[result], [result]]),
+        page_extractor=extractor,
+    )
+    interrupts = []
+
+    state = invoke_react_flight_search(
+        graph,
+        {"intent": _intent()},
+        human_verification_handler=lambda payload: interrupts.append(payload) or True,
+    )
+
+    assert len(interrupts) == 1
+    assert state["human_interrupt_count"] == 1
+    assert state["iteration"] == 2
+    assert state["action_history"][1]["action"] == "refresh_capture"
+    assert state["verified_flight_options"][0].price == 840
+
+
+def test_react_interrupt_decline_finishes_route_without_retry():
+    result = _result("flights.ctrip.com", "https://example.com/flight")
+    graph = build_react_flight_search_graph(
+        web_search=FakeSearchTool([[result]]),
+        page_extractor=FakeAdaptiveExtractor(
+            [
+                FlightPageAttemptResult(
+                    status="captcha_required",
+                    evidence=[],
+                    entrypoint="international",
+                    source_url=result.url,
+                )
+            ]
+        ),
+    )
+
+    state = invoke_react_flight_search(graph, {"intent": _intent()})
+
+    assert state["iteration"] == 1
+    assert state["verified_flight_options"] == []
+    assert state["termination_reason"] == "human_verification_declined"
+
+
+def test_react_never_accepts_wrong_date_as_preference_fallback():
+    result = _result("flights.ctrip.com", "https://example.com/flight")
+    wrong_date = _evidence(
+        "flights.ctrip.com",
+        result.url,
+        700,
+        travel_date=date(2026, 7, 10),
+        departure_time=datetime(2026, 7, 10, 20, 0, tzinfo=timezone.utc),
+    )
+    graph = build_react_flight_search_graph(
+        web_search=FakeSearchTool([[result]]),
+        page_extractor=FakeAdaptiveExtractor(
+            [
+                FlightPageAttemptResult(
+                    status="time_preference_mismatch",
+                    evidence=[wrong_date],
+                    entrypoint="international",
+                    source_url=result.url,
+                )
+            ]
+        ),
+        max_iterations=1,
+    )
+
+    state = graph.invoke({"intent": _intent()})
+
+    assert state["fallback_evidence"] == []
+    assert state["verified_flight_options"] == []
+    assert state["termination_reason"] == "insufficient_evidence"
 
 
 def test_skyscanner_route_search_constructs_route_url_from_airport_codes():

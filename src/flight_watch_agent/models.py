@@ -47,6 +47,24 @@ class SearchResult:
 
 
 @dataclass(frozen=True)
+class FlightPageAttemptResult:
+    status: Literal[
+        "success",
+        "no_payload",
+        "no_evidence",
+        "parse_failed",
+        "captcha_required",
+        "login_required",
+        "time_preference_mismatch",
+        "tool_error",
+    ]
+    evidence: list["FlightEvidence"]
+    entrypoint: str
+    source_url: str | None = None
+    warning: str | None = None
+
+
+@dataclass(frozen=True)
 class FlightEvidence:
     source_name: str
     url: str

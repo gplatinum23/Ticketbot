@@ -547,6 +547,110 @@ def test_ctrip_extractor_prioritises_search_url_that_succeeded_in_session(monkey
     extractor.close()
 
 
+def test_ctrip_adaptive_attempt_uses_requested_entrypoint(monkeypatch):
+    class AttemptDriver:
+        def __init__(self) -> None:
+            self._requests = []
+            self.urls = []
+
+        @property
+        def requests(self):
+            return self._requests
+
+        @requests.deleter
+        def requests(self):
+            self._requests = []
+
+        def get(self, url: str) -> None:
+            self.urls.append(url)
+
+        def quit(self) -> None:
+            return None
+
+    driver = AttemptDriver()
+    monkeypatch.setattr(ctrip_module, "_init_seleniumwire_driver", lambda **_kwargs: driver)
+    monkeypatch.setattr(ctrip_module, "_wait_for_ctrip_search_payload", lambda *_args, **_kwargs: {})
+
+    def parse_payload(_payload, intent, **kwargs):
+        timestamp = datetime.combine(intent.travel_date, datetime.min.time(), tzinfo=timezone.utc)
+        return [
+            FlightEvidence(
+                source_name="flights.ctrip.com",
+                url=kwargs["source_url"],
+                price=500.0,
+                currency="CNY",
+                departure_time=timestamp,
+                arrival_time=timestamp,
+                captured_at=timestamp,
+                origin=intent.origin,
+                destination=intent.destination,
+                travel_date=intent.travel_date,
+            )
+        ]
+
+    monkeypatch.setattr(ctrip_module, "parse_ctrip_batch_search_payload", parse_payload)
+    extractor = CtripSeleniumWirePageExtractor(reuse_browser_session=True)
+
+    attempt = extractor.extract_attempt(
+        build_ctrip_selenium_url(
+            FlightSearchIntent(origin="CTU", destination="SIN", travel_date=date(2026, 8, 1))
+        ),
+        entrypoint="online_list",
+        action_id="action-2",
+    )
+
+    assert attempt.status == "success"
+    assert attempt.entrypoint == "online_list"
+    assert "/online/list/" in driver.urls[-1]
+    extractor.close()
+
+
+def test_ctrip_adaptive_attempt_returns_captcha_observation(monkeypatch):
+    class CaptchaDriver:
+        def __init__(self) -> None:
+            self._requests = []
+
+        @property
+        def requests(self):
+            return self._requests
+
+        @requests.deleter
+        def requests(self):
+            self._requests = []
+
+        def get(self, _url: str) -> None:
+            return None
+
+        def quit(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        ctrip_module,
+        "_init_seleniumwire_driver",
+        lambda **_kwargs: CaptchaDriver(),
+    )
+    monkeypatch.setattr(
+        ctrip_module,
+        "_wait_for_ctrip_search_payload",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ctrip_module.CtripManualVerificationRequired("verification required")
+        ),
+    )
+    extractor = CtripSeleniumWirePageExtractor(reuse_browser_session=True)
+
+    attempt = extractor.extract_attempt(
+        build_ctrip_selenium_url(
+            FlightSearchIntent(origin="CTU", destination="SIN", travel_date=date(2026, 8, 1))
+        ),
+        entrypoint="international",
+        action_id="action-1",
+    )
+
+    assert attempt.status == "captcha_required"
+    assert attempt.evidence == []
+    extractor.close()
+
+
 def test_configure_browser_options_uses_incognito_without_local_profile():
     options = FakeBrowserOptions()
 
