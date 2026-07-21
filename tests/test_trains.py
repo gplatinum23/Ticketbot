@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+import json
 from datetime import date
 from pathlib import Path
 
@@ -77,6 +79,53 @@ def test_stdio_mcp_client_defaults_to_12306_mcp_npx():
 
     assert client.args == ["-y", "12306-mcp"]
     assert Path(client.command).name.lower() in {"npx", "npx.cmd"}
+
+
+def test_stdio_mcp_client_reuses_initialized_process_for_multiple_calls():
+    responses = [
+        {"jsonrpc": "2.0", "id": 1, "result": {}},
+        {"jsonrpc": "2.0", "id": 2, "result": {"content": [{"type": "text", "text": "[]"}]}},
+        {"jsonrpc": "2.0", "id": 3, "result": {"content": [{"type": "text", "text": "[]"}]}},
+    ]
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.stdin = io.StringIO()
+            self.stdout = io.StringIO("".join(json.dumps(item) + "\n" for item in responses))
+            self.stderr = io.StringIO()
+            self.killed = False
+
+        def poll(self):
+            return 0 if self.killed else None
+
+        def kill(self) -> None:
+            self.killed = True
+
+    class FakeStdioMcpToolClient(StdioMcpToolClient):
+        def __init__(self) -> None:
+            super().__init__(command="npx", args=["12306-mcp"])
+            self.processes = []
+
+        def _start_process(self):
+            proc = FakeProcess()
+            self.processes.append(proc)
+            return proc
+
+    client = FakeStdioMcpToolClient()
+
+    assert client.call_tool("get-tickets", {"route": 1}) == []
+    assert client.call_tool("get-tickets", {"route": 2}) == []
+
+    assert len(client.processes) == 1
+    sent_messages = [json.loads(line) for line in client.processes[0].stdin.getvalue().splitlines()]
+    assert [message["method"] for message in sent_messages] == [
+        "initialize",
+        "notifications/initialized",
+        "tools/call",
+        "tools/call",
+    ]
+    client.close()
+    assert client.processes[0].killed is True
 
 
 def test_mcp_12306_provider_maps_airport_codes_to_train_places():

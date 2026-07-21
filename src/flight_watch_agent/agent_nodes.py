@@ -34,6 +34,11 @@ SUPPORTED_EXECUTABLE_STRATEGIES: set[TravelStrategy] = {
     "flight_flight",
 }
 
+INTERNATIONAL_ROUTE_TYPES = {"china_to_abroad", "abroad_to_china", "abroad_to_abroad"}
+MIN_INTERNATIONAL_FLIGHT_POTENTIAL = 0.50
+ALLOWED_INTERNATIONAL_TIERS = {"T1", "T2"}
+TIER_RANK = {"T1": 4, "T2": 3, "T3": 2, "T4": 1}
+
 
 def classify_region(intent: FlightSearchIntent) -> RegionInfo:
     origin_country = _place_country(intent.origin)
@@ -100,6 +105,8 @@ def generate_candidate_hubs(
                 strategies=usable_strategies,
                 priority=hub.priority,
                 reason=hub.reason,
+                flight_potential_score=hub.flight_potential_score,
+                flight_tier=hub.flight_tier,
             )
         )
         for strategy in usable_strategies:
@@ -133,9 +140,50 @@ def generate_candidate_hubs_for_places(
                 strategies=usable_strategies,
                 priority=hub.priority,
                 reason=hub.reason,
+                flight_potential_score=hub.flight_potential_score,
+                flight_tier=hub.flight_tier,
             )
         )
     return hubs
+
+
+def generate_candidate_hubs_for_place_mentions(
+    mentions: list[object],
+    strategy_selection: StrategySelection,
+) -> tuple[list[CandidateHub], list[str]]:
+    route_type = _route_type_from_strategy_selection(strategy_selection)
+    hubs: list[CandidateHub] = []
+    warnings: list[str] = []
+    seen: set[str] = set()
+    for mention in mentions:
+        hub = _candidate_hub_from_mention(mention, route_type)
+        label = _mention_label(mention)
+        if hub is None:
+            warnings.append(f"hub_place_unresolved:{label}")
+            continue
+        usable_strategies = [
+            strategy for strategy in hub.strategies if strategy in strategy_selection.enabled
+        ]
+        if not usable_strategies:
+            warnings.append(f"hub_place_no_enabled_strategy:{label}")
+            continue
+        if hub.hub_id in seen:
+            continue
+        seen.add(hub.hub_id)
+        hubs.append(
+            CandidateHub(
+                hub_id=hub.hub_id,
+                city=hub.city,
+                airport_codes=hub.airport_codes,
+                train_places=hub.train_places,
+                strategies=usable_strategies,
+                priority=hub.priority,
+                reason=hub.reason,
+                flight_potential_score=hub.flight_potential_score,
+                flight_tier=hub.flight_tier,
+            )
+        )
+    return hubs, warnings
 
 
 def build_query_plan(
@@ -150,19 +198,30 @@ def build_query_plan(
     warnings: list[str] = []
     train_count = 0
     flight_count = 0
+    train_queries: set[tuple[str, str, date]] = set()
+    flight_queries: set[tuple[str, str, date]] = set()
 
     def add_item(item: QueryPlanItem) -> None:
         nonlocal train_count, flight_count
+        signature = (
+            item.origin.strip().casefold(),
+            item.destination.strip().casefold(),
+            item.travel_date,
+        )
         if item.mode == "train":
-            if train_count >= budget.max_train_queries:
+            if signature not in train_queries and train_count >= budget.max_train_queries:
                 warnings.append(f"train_query_budget_exhausted:{item.query_id}")
                 return
-            train_count += 1
+            if signature not in train_queries:
+                train_queries.add(signature)
+                train_count += 1
         if item.mode == "flight":
-            if flight_count >= budget.max_flight_queries:
+            if signature not in flight_queries and flight_count >= budget.max_flight_queries:
                 warnings.append(f"flight_query_budget_exhausted:{item.query_id}")
                 return
-            flight_count += 1
+            if signature not in flight_queries:
+                flight_queries.add(signature)
+                flight_count += 1
         items.append(item)
 
     if "direct_flight" in strategy_selection.enabled:
@@ -379,10 +438,15 @@ def _generate_hubs_from_indexes(intent: FlightSearchIntent, route_type: str) -> 
     destination_code = (
         destination_airport.iata if destination_airport is not None else normalise_airport_code(intent.destination)
     )
+    origin_endpoint = _airport_endpoint_key(origin_airport)
+    destination_endpoint = _airport_endpoint_key(destination_airport)
 
     grouped: dict[str, dict[str, object]] = {}
     for airport in airport_index.airports:
         if airport.iata in {origin_code, destination_code}:
+            continue
+        airport_endpoint = _airport_endpoint_key(airport)
+        if airport_endpoint is not None and airport_endpoint in {origin_endpoint, destination_endpoint}:
             continue
         city_name = station_city_for_airport(airport)
         if airport.country == "CN" and city_name is None and route_type != "abroad_to_abroad":
@@ -390,6 +454,8 @@ def _generate_hubs_from_indexes(intent: FlightSearchIntent, route_type: str) -> 
         if route_type in {"china_to_abroad", "abroad_to_china", "china_domestic"} and airport.country != "CN":
             continue
         if route_type == "abroad_to_abroad" and airport.iata in {origin_code, destination_code}:
+            continue
+        if route_type in INTERNATIONAL_ROUTE_TYPES and not _airport_allowed_for_international_hub(airport):
             continue
 
         hub_city = city_name or airport.city or airport.name
@@ -402,10 +468,20 @@ def _generate_hubs_from_indexes(intent: FlightSearchIntent, route_type: str) -> 
                 "airport_codes": [],
                 "train_places": [],
                 "priority": _hub_priority(airport, origin_airport, destination_airport, route_type),
+                "flight_potential_score": airport.flight_potential_score,
+                "flight_tier": airport.flight_tier,
                 "reason": _hub_reason(route_type),
             },
         )
         entry["airport_codes"].append(airport.iata)  # type: ignore[index, union-attr]
+        entry["flight_potential_score"] = _max_optional_float(  # type: ignore[index]
+            entry.get("flight_potential_score"),
+            airport.flight_potential_score,
+        )
+        entry["flight_tier"] = _best_flight_tier(  # type: ignore[index]
+            entry.get("flight_tier"),
+            airport.flight_tier,
+        )
         entry["priority"] = max(  # type: ignore[index]
             float(entry["priority"]),
             _hub_priority(airport, origin_airport, destination_airport, route_type),
@@ -421,6 +497,13 @@ def _generate_hubs_from_indexes(intent: FlightSearchIntent, route_type: str) -> 
         country = str(entry["country"])
         train_places = list(entry["train_places"]) if isinstance(entry["train_places"], list) else []
         airport_codes = _rank_airport_codes(list(entry["airport_codes"]))  # type: ignore[arg-type]
+        flight_potential_score = _optional_float(entry.get("flight_potential_score"))
+        flight_tier = str(entry["flight_tier"]) if entry.get("flight_tier") else None
+        if route_type in INTERNATIONAL_ROUTE_TYPES and not _hub_allowed_for_international_route(
+            flight_potential_score,
+            flight_tier,
+        ):
+            continue
         strategies = _strategies_for_index_hub(route_type, country, airport_codes, train_places)
         if not strategies:
             continue
@@ -433,32 +516,55 @@ def _generate_hubs_from_indexes(intent: FlightSearchIntent, route_type: str) -> 
                 strategies=strategies,
                 priority=float(entry["priority"]),
                 reason=str(entry["reason"]),
+                flight_potential_score=flight_potential_score,
+                flight_tier=flight_tier,
             )
         )
     return sorted(hubs, key=lambda item: item.priority, reverse=True)
+
+
+def _airport_endpoint_key(airport) -> tuple[str, str] | None:
+    if airport is None:
+        return None
+    city = station_city_for_airport(airport) or airport.city
+    if not city:
+        return None
+    return (airport.country, city.strip().casefold())
 
 
 def _candidate_hub_from_place(place: str, route_type: str) -> CandidateHub | None:
     airport_index = get_airport_index()
     station_index = get_station_index()
     airport = airport_index.resolve(place)
-    station_name = station_index.resolve(place)
+    station_name = None if airport is not None else station_index.resolve(place)
     station_record = None
     if station_name is not None:
         station_record = station_index.by_name.get(station_name) or station_index.by_code.get(station_name.upper())
 
-    city_name = station_record.city_name if station_record is not None else None
-    if city_name is None and airport is not None:
+    city_name = None
+    if airport is not None:
         city_name = station_city_for_airport(airport)
+    if city_name is None and station_record is not None:
+        city_name = station_record.city_name
 
     airport_codes: list[str] = []
-    if airport is not None:
+    if airport is not None and (
+        route_type not in INTERNATIONAL_ROUTE_TYPES
+        or _airport_allowed_for_international_hub(airport)
+    ):
         airport_codes.append(airport.iata)
     if city_name is not None:
         for candidate in airport_index.airports:
-            if station_city_for_airport(candidate) == city_name:
+            if (
+                station_city_for_airport(candidate) == city_name
+                and (
+                    route_type not in INTERNATIONAL_ROUTE_TYPES
+                    or _airport_allowed_for_international_hub(candidate)
+                )
+            ):
                 airport_codes.append(candidate.iata)
     airport_codes = _rank_airport_codes(airport_codes)[:2]
+    flight_potential_score, flight_tier = _flight_potential_for_airport_codes(airport_codes)
 
     train_places: list[str] = []
     if station_name is not None:
@@ -471,6 +577,11 @@ def _candidate_hub_from_place(place: str, route_type: str) -> CandidateHub | Non
     country = airport.country if airport is not None else ("CN" if train_places else "")
     city = city_name or (airport.city if airport is not None else None) or station_name or place
     strategies = _strategies_for_index_hub(route_type, country, airport_codes, train_places)
+    if route_type in INTERNATIONAL_ROUTE_TYPES and not _hub_allowed_for_international_route(
+        flight_potential_score,
+        flight_tier,
+    ):
+        return None
     if not strategies:
         return None
     return CandidateHub(
@@ -481,7 +592,69 @@ def _candidate_hub_from_place(place: str, route_type: str) -> CandidateHub | Non
         strategies=strategies,
         priority=10.0,
         reason=f"Resolved from user/LLM hub '{place}' using airport and station indexes.",
+        flight_potential_score=flight_potential_score,
+        flight_tier=flight_tier,
     )
+
+
+def _candidate_hub_from_mention(mention: object, route_type: str) -> CandidateHub | None:
+    for value in _mention_lookup_values(mention):
+        hub = _candidate_hub_from_place(value, route_type)
+        if hub is not None:
+            return CandidateHub(
+                hub_id=hub.hub_id,
+                city=hub.city,
+                airport_codes=hub.airport_codes,
+                train_places=hub.train_places,
+                strategies=hub.strategies,
+                priority=hub.priority,
+                reason=f"Resolved from structured hub '{_mention_label(mention)}' using airport and station indexes.",
+                flight_potential_score=hub.flight_potential_score,
+                flight_tier=hub.flight_tier,
+            )
+    return None
+
+
+def _mention_lookup_values(mention: object) -> list[str]:
+    if isinstance(mention, str):
+        return [mention]
+    if hasattr(mention, "model_dump"):
+        raw = mention.model_dump(exclude_none=True)
+    elif isinstance(mention, dict):
+        raw = mention
+    else:
+        raw = {
+            name: getattr(mention, name)
+            for name in (
+                "iata_if_explicit",
+                "official_airport_name",
+                "station_name",
+                "city",
+                "raw_text",
+                "station_pinyin",
+            )
+            if hasattr(mention, name) and getattr(mention, name) is not None
+        }
+    values: list[str] = []
+    for key in (
+        "iata_if_explicit",
+        "official_airport_name",
+        "station_name",
+        "city",
+        "raw_text",
+        "station_pinyin",
+    ):
+        value = raw.get(key) if isinstance(raw, dict) else None
+        if isinstance(value, str) and value.strip() and value.strip() not in values:
+            values.append(value.strip())
+    return values
+
+
+def _mention_label(mention: object) -> str:
+    values = _mention_lookup_values(mention)
+    if values:
+        return values[0]
+    return str(mention)
 
 
 def _strategies_for_index_hub(
@@ -521,26 +694,23 @@ def _strategies_for_index_hub(
 
 
 def _hub_priority(airport, origin_airport, destination_airport, route_type: str) -> float:
-    score = 1.0
-    if "International" in airport.name:
-        score += 0.25
-    if airport.country == "CN":
-        score += 0.1
+    potential = airport.flight_potential_score or 0.0
     if route_type == "china_to_abroad":
-        score += _distance_score(origin_airport, airport)
+        access_score = _distance_score(origin_airport, airport)
     elif route_type == "abroad_to_china":
-        score += _distance_score(destination_airport, airport)
+        access_score = _distance_score(destination_airport, airport)
     elif route_type == "china_domestic":
-        score += max(
+        access_score = max(
             _distance_score(origin_airport, airport),
             _distance_score(destination_airport, airport),
         )
     else:
-        score += max(
+        access_score = max(
             _distance_score(origin_airport, airport),
             _distance_score(destination_airport, airport),
         )
-    return score
+    detour_penalty = _detour_penalty(origin_airport, destination_airport, airport)
+    return 0.60 * potential + 0.25 * access_score - 0.15 * detour_penalty
 
 
 def _distance_score(reference, airport) -> float:
@@ -564,7 +734,17 @@ def _distance_km(a, b) -> float | None:
 
 
 def _rank_airport_codes(codes: list[str]) -> list[str]:
-    return list(dict.fromkeys(sorted(codes)))
+    airport_index = get_airport_index()
+    deduped = list(dict.fromkeys(codes))
+    return sorted(
+        deduped,
+        key=lambda code: (
+            -(airport_index.resolve(code).flight_potential_score or 0.0)
+            if airport_index.resolve(code) is not None
+            else 0.0,
+            code,
+        ),
+    )
 
 
 def _hub_id_from_key(key: str) -> str:
@@ -578,7 +758,76 @@ def _hub_id_from_key(key: str) -> str:
 
 
 def _hub_reason(route_type: str) -> str:
-    return f"Generated from resources/airports.csv and resources/station_name.js for {route_type}."
+    return (
+        "Generated from flight-potential airport index and resources/station_name.js "
+        f"for {route_type}."
+    )
+
+
+def _airport_allowed_for_international_hub(airport) -> bool:
+    return _hub_allowed_for_international_route(
+        airport.flight_potential_score,
+        airport.flight_tier,
+    )
+
+
+def _hub_allowed_for_international_route(
+    flight_potential_score: float | None,
+    flight_tier: str | None,
+) -> bool:
+    return (
+        flight_tier in ALLOWED_INTERNATIONAL_TIERS
+        and flight_potential_score is not None
+        and flight_potential_score >= MIN_INTERNATIONAL_FLIGHT_POTENTIAL
+    )
+
+
+def _flight_potential_for_airport_codes(codes: list[str]) -> tuple[float | None, str | None]:
+    airport_index = get_airport_index()
+    score: float | None = None
+    tier: str | None = None
+    for code in codes:
+        airport = airport_index.resolve(code)
+        if airport is None:
+            continue
+        score = _max_optional_float(score, airport.flight_potential_score)
+        tier = _best_flight_tier(tier, airport.flight_tier)
+    return score, tier
+
+
+def _max_optional_float(left: object, right: float | None) -> float | None:
+    left_float = _optional_float(left)
+    if left_float is None:
+        return right
+    if right is None:
+        return left_float
+    return max(left_float, right)
+
+
+def _optional_float(value: object) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def _best_flight_tier(left: object, right: str | None) -> str | None:
+    left_text = left if isinstance(left, str) else None
+    if left_text is None:
+        return right
+    if right is None:
+        return left_text
+    return left_text if TIER_RANK.get(left_text, 0) >= TIER_RANK.get(right, 0) else right
+
+
+def _detour_penalty(origin_airport, destination_airport, hub_airport) -> float:
+    if origin_airport is None or destination_airport is None:
+        return 0.0
+    direct = _distance_km(origin_airport, destination_airport)
+    first = _distance_km(origin_airport, hub_airport)
+    second = _distance_km(hub_airport, destination_airport)
+    if direct is None or first is None or second is None or direct <= 0:
+        return 0.0
+    return max(0.0, (first + second - direct) / direct)
 
 
 _COUNTRY_OVERRIDES = {

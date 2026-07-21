@@ -26,6 +26,10 @@ def test_airport_index_loads_csv_and_resolves_structured_queries():
     assert index.resolve(AirportQuery(iata="SIN")).name == "Singapore Changi Airport"
     assert index.resolve(AirportQuery(name="Nanjing Lukou", city="Nanjing", country="CN")).iata == "NKG"
     assert index.resolve(AirportQuery(iata="PVG")).name == "Shanghai Pudong International Airport"
+    assert index.resolve(AirportQuery(iata="CTU")).flight_tier == "T1"
+    assert index.resolve(AirportQuery(iata="CTU")).flight_potential_score == 0.86
+    assert index.resolve(AirportQuery(iata="ZKL")).flight_tier == "T4"
+    assert index.resolve(AirportQuery(iata="ZKL")).flight_potential_score == 0.16
 
 
 def test_airport_index_normalises_names_to_iata():
@@ -34,6 +38,13 @@ def test_airport_index_normalises_names_to_iata():
     assert normalise_airport_code("新加坡") == "SIN"
     assert normalise_airport_code("成都天府") == "TFU"
     assert normalise_airport_code("nkg") == "NKG"
+
+
+def test_airport_index_prefers_high_potential_airport_for_city_query():
+    airport = get_airport_index().resolve(AirportQuery(city="Chengdu", country="CN"))
+
+    assert airport is not None
+    assert airport.iata == "TFU"
 
 
 def test_train_place_normalisation_uses_station_and_airport_tables_separately():

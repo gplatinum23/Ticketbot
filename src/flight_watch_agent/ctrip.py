@@ -3,6 +3,7 @@ from __future__ import annotations
 import gzip
 import json
 import os
+import atexit
 import threading
 import time
 import urllib.parse
@@ -49,6 +50,7 @@ class CtripSeleniumWirePageExtractor:
         cookies_file: str | os.PathLike[str] = DEFAULT_CTRIP_COOKIES_FILE,
         login_wait_seconds: int = 300,
         manual_verification_wait_seconds: int = 0,
+        reuse_browser_session: bool = True,
     ) -> None:
         self.browser = browser
         self.headless = headless
@@ -61,17 +63,43 @@ class CtripSeleniumWirePageExtractor:
         self.cookies_file = Path(cookies_file)
         self.login_wait_seconds = login_wait_seconds
         self.manual_verification_wait_seconds = manual_verification_wait_seconds
+        self.reuse_browser_session = reuse_browser_session
+        self._driver = None
+        self._driver_ready = False
+        self._driver_lock = threading.RLock()
+        self._preferred_search_url_index: int | None = None
+        atexit.register(self.close)
 
     def supports(self, url: str) -> bool:
         return urllib.parse.urlparse(url).scheme == CTRIP_SCHEME
 
+    def close(self) -> None:
+        with self._driver_lock:
+            driver = self._driver
+            self._driver = None
+            self._driver_ready = False
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+    def _acquire_driver(self):
+        if not self.reuse_browser_session:
+            return _init_seleniumwire_driver(browser=self.browser, headless=self.headless), True
+        with self._driver_lock:
+            if self._driver is None:
+                self._driver = _init_seleniumwire_driver(browser=self.browser, headless=self.headless)
+                return self._driver, True
+            return self._driver, False
+
     def extract(self, url: str) -> list[FlightEvidence]:
         intent = parse_ctrip_selenium_url(url)
-        driver = _init_seleniumwire_driver(browser=self.browser, headless=self.headless)
+        driver, is_new_driver = self._acquire_driver()
         errors: list[str] = []
         fallback_evidence: list[FlightEvidence] = []
         try:
-            if self.login_allowed:
+            if self.login_allowed and (is_new_driver or not self._driver_ready):
                 _CtripLoginSession(
                     accounts=self.accounts,
                     passwords=self.passwords,
@@ -79,7 +107,17 @@ class CtripSeleniumWirePageExtractor:
                     timeout_seconds=self.timeout_seconds,
                     login_wait_seconds=self.login_wait_seconds,
                 ).ensure_login(driver)
-            for search_url in _build_ctrip_search_urls(intent):
+            if self.reuse_browser_session:
+                self._driver_ready = True
+            search_urls = _build_ctrip_search_urls(intent)
+            indexed_search_urls = list(enumerate(search_urls))
+            if (
+                self._preferred_search_url_index is not None
+                and 0 <= self._preferred_search_url_index < len(search_urls)
+            ):
+                preferred = self._preferred_search_url_index
+                indexed_search_urls.sort(key=lambda item: 0 if item[0] == preferred else 1)
+            for search_url_index, search_url in indexed_search_urls:
                 try:
                     del driver.requests
                 except AttributeError:
@@ -109,6 +147,7 @@ class CtripSeleniumWirePageExtractor:
                             manual_verification_wait_seconds=self.manual_verification_wait_seconds,
                         )
                     if evidence:
+                        self._preferred_search_url_index = search_url_index
                         if _evidence_satisfies_requested_time(evidence, intent):
                             return evidence
                         if not fallback_evidence:
@@ -164,7 +203,10 @@ class CtripSeleniumWirePageExtractor:
                 raise RuntimeError("Ctrip SeleniumWire extraction failed; attempts=" + " | ".join(errors))
             return []
         finally:
-            driver.quit()
+            if not self.reuse_browser_session:
+                driver.quit()
+            elif not self._driver_ready:
+                self.close()
 
 
 def build_ctrip_selenium_url(intent: FlightSearchIntent) -> str:

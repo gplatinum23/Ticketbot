@@ -12,9 +12,10 @@ from .app import (
     build_default_travel_plan_agent,
 )
 from .models import FlightSearchIntent
+from .progress import ConsoleProgressReporter, NoopProgressReporter
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     _configure_stdio()
     parser = argparse.ArgumentParser(prog="flight-watch")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -24,6 +25,7 @@ def main() -> None:
     ask_parser.add_argument("--model", help="LangChain model string, e.g. openai:gpt-4.1-mini.")
     ask_parser.add_argument("--flight-only", action="store_true", help="Skip train lookup and test flight planning only.")
     ask_parser.add_argument("--show-flight-raw", action="store_true", help="Print raw flight search debug output.")
+    ask_parser.add_argument("--quiet", action="store_true", help="Hide progress messages.")
     plan_parser = subparsers.add_parser("plan-flight", help="Search train and verified public flight options.")
     plan_parser.add_argument("--origin", required=True)
     plan_parser.add_argument("--destination", required=True)
@@ -32,6 +34,7 @@ def main() -> None:
     plan_parser.add_argument("--budget", type=float)
     plan_parser.add_argument("--currency", default="CNY")
     plan_parser.add_argument("--show-flight-raw", action="store_true", help="Print raw flight search debug output.")
+    plan_parser.add_argument("--quiet", action="store_true", help="Hide progress messages.")
     debug_parser = subparsers.add_parser(
         "debug-flight-search",
         help="Debug only the public-page flight search pipeline.",
@@ -40,9 +43,13 @@ def main() -> None:
     debug_parser.add_argument("--max-iterations", type=int, default=3)
     debug_parser.add_argument("--no-llm-judge", action="store_true", help="Skip LLM evidence judging.")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.command == "ask":
-        graph = build_default_request_agent(llm_model=args.model, include_train=not args.flight_only)
+        graph = build_default_request_agent(
+            llm_model=args.model,
+            include_train=not args.flight_only,
+            progress_reporter=_progress_reporter_from_args(args),
+        )
         state = graph.invoke({"user_input": " ".join(args.text)})
         print(state["response"])
         if args.show_flight_raw:
@@ -50,7 +57,7 @@ def main() -> None:
         return
 
     if args.command == "plan-flight":
-        graph = build_default_travel_plan_agent()
+        graph = build_default_travel_plan_agent(progress_reporter=_progress_reporter_from_args(args))
         state = graph.invoke(
             {
                 "intent": _flight_search_intent_from_args(args)
@@ -69,6 +76,12 @@ def main() -> None:
         state = graph.invoke({"intent": _flight_search_intent_from_args(args)})
         print(_format_react_flight_raw_output(state))
         return
+
+
+def _progress_reporter_from_args(args):
+    if getattr(args, "quiet", False):
+        return NoopProgressReporter()
+    return ConsoleProgressReporter()
 
 
 def _add_flight_intent_arguments(parser: argparse.ArgumentParser) -> None:

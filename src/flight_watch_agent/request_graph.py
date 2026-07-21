@@ -12,6 +12,7 @@ from .llm import (
     to_flight_search_intent,
 )
 from .models import FlightSearchIntent
+from .progress import ProgressReporter, get_progress_reporter
 from .travel_plan_graph import TravelPlanState
 
 
@@ -25,10 +26,12 @@ class TravelPlanRequestState(TypedDict, total=False):
     plan_state: TravelPlanState
 
 
-def build_travel_plan_request_graph(*, llm, travel_plan_graph):
+def build_travel_plan_request_graph(*, llm, travel_plan_graph, progress_reporter: ProgressReporter | None = None):
+    progress = get_progress_reporter(progress_reporter)
     graph = StateGraph(TravelPlanRequestState)
 
     def parse_intent(state: TravelPlanRequestState) -> TravelPlanRequestState:
+        progress.emit("解析自然语言出行需求...")
         intent = parse_travel_plan_intent(
             state["user_input"],
             llm,
@@ -37,6 +40,7 @@ def build_travel_plan_request_graph(*, llm, travel_plan_graph):
         return {"intent": intent}
 
     def plan_or_clarify(state: TravelPlanRequestState) -> TravelPlanRequestState:
+        progress.emit("检查出行需求字段...")
         intent = state["intent"]
         missing_fields = required_missing_fields(intent)
         if missing_fields:
@@ -53,7 +57,14 @@ def build_travel_plan_request_graph(*, llm, travel_plan_graph):
         except ValueError as exc:
             return {"response": str(exc), "errors": [str(exc)]}
 
-        plan_state = travel_plan_graph.invoke({"intent": flight_search_intent})
+        progress.emit("进入综合出行规划...")
+        plan_state = travel_plan_graph.invoke(
+            {
+                "intent": flight_search_intent,
+                "user_input": state["user_input"],
+                "explicit_hub_places": intent.hub_places,
+            }
+        )
         return {
             "flight_search_intent": flight_search_intent,
             "plan_state": plan_state,

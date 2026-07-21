@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import date
 from typing import Literal
 
@@ -8,7 +9,13 @@ from pydantic import BaseModel, Field
 
 from .config import get_config, load_env_file
 from .models import FlightSearchIntent
-from .places import airport_alias_map, airport_prompt_hints, normalise_airport_code
+from .places import (
+    AirportQuery,
+    airport_alias_map,
+    airport_prompt_hints,
+    get_airport_index,
+    normalise_airport_code,
+)
 
 
 DEFAULT_LLM_MODEL = "openai:gpt-4.1-mini"
@@ -25,6 +32,18 @@ class TravelPlanIntent(BaseModel):
     destination: str | None = Field(
         default=None,
         description="Destination city, airport name, station name, or airport code as expressed by the user.",
+    )
+    origin_place: "PlaceMention | None" = Field(
+        default=None,
+        description="Structured origin place extracted from the user request.",
+    )
+    destination_place: "PlaceMention | None" = Field(
+        default=None,
+        description="Structured destination place extracted from the user request.",
+    )
+    hub_places: list["PlaceMention"] = Field(
+        default_factory=list,
+        description="Explicit transfer hubs or user-suggested intermediate places.",
     )
     travel_date: date | None = Field(
         default=None,
@@ -48,6 +67,26 @@ class TravelPlanIntent(BaseModel):
         default=None,
         description="Short question to ask the user when required information is missing.",
     )
+
+
+class PlaceMention(BaseModel):
+    raw_text: str | None = Field(default=None, description="Original place text from the user.")
+    kind: Literal["airport", "station", "city", "unknown"] = Field(default="unknown")
+    official_airport_name: str | None = Field(
+        default=None,
+        description="Official English airport name when the place is an airport.",
+    )
+    city: str | None = Field(default=None, description="City name in English or Chinese.")
+    country: str | None = Field(default=None, description="ISO country code if known.")
+    iata_if_explicit: str | None = Field(
+        default=None,
+        description="IATA code only if explicitly provided by the user.",
+    )
+    station_name: str | None = Field(
+        default=None,
+        description="12306 Chinese station name when the place is a railway station.",
+    )
+    station_pinyin: str | None = Field(default=None, description="Station pinyin if known.")
 
 
 def build_default_llm(model: str | None = None):
@@ -109,8 +148,8 @@ def to_flight_search_intent(intent: TravelPlanIntent) -> FlightSearchIntent:
 
 def _normalize_intent(intent: TravelPlanIntent, *, user_input: str = "") -> TravelPlanIntent:
     updates: dict[str, object] = {}
-    origin = _normalise_place(intent.origin)
-    destination = _normalise_place(intent.destination)
+    origin = _normalise_endpoint(intent.origin, intent.origin_place, user_input)
+    destination = _normalise_endpoint(intent.destination, intent.destination_place, user_input)
     if origin is None or destination is None:
         inferred_origin, inferred_destination = _infer_route_from_text(user_input)
         origin = origin or inferred_origin
@@ -147,6 +186,9 @@ Today is {today.isoformat()}.
 Rules:
 - Return plan_trip when the user asks to find, compare, search, plan, or recommend travel options.
 - Preserve the user's city, airport, station name, or explicit airport code; do not invent an airport code.
+- Also populate origin_place and destination_place with official English airport names or 12306 Chinese station names when possible.
+- Put explicit transfer hubs mentioned by the user in hub_places. Use 12306 Chinese station names for railway stations.
+- For iata_if_explicit, only copy an IATA code that the user explicitly wrote.
 - The application will resolve airport codes from its local airport CSV and station index after this step.
 - Common airport lookup hints:
   {place_hints}
@@ -191,6 +233,73 @@ _TIME_ALIASES = {
 
 def _normalise_place(value: str | None) -> str | None:
     return normalise_airport_code(value)
+
+
+def _normalise_place_mention(value: PlaceMention | None) -> str | None:
+    if value is None:
+        return None
+    for candidate in (
+        value.iata_if_explicit,
+        value.official_airport_name,
+        value.station_name,
+        value.city,
+        value.raw_text,
+        value.station_pinyin,
+    ):
+        resolved = _normalise_place(candidate)
+        if resolved:
+            return resolved
+    return None
+
+
+def _normalise_endpoint(
+    raw_value: str | None,
+    mention: PlaceMention | None,
+    user_input: str,
+) -> str | None:
+    if mention is not None:
+        explicit_iata = (mention.iata_if_explicit or "").strip().upper()
+        if explicit_iata and _text_contains_token(user_input, explicit_iata):
+            return _normalise_place(explicit_iata)
+
+        # raw_text is the model's copy of what the user actually wrote. Resolve it
+        # before accepting a model-selected airport for a city-level request.
+        if mention.raw_text and _text_contains_value(user_input, mention.raw_text):
+            resolved = _normalise_place(mention.raw_text)
+            if resolved:
+                return resolved
+
+    if raw_value and _text_contains_value(user_input, raw_value):
+        resolved = _normalise_place(raw_value)
+        if resolved:
+            return resolved
+
+    if mention is not None and mention.city:
+        airport = get_airport_index().resolve(
+            AirportQuery(
+                name=mention.official_airport_name if mention.kind == "airport" else None,
+                city=mention.city,
+                country=mention.country or "",
+                raw_text=mention.raw_text,
+            )
+        )
+        if airport is not None:
+            return airport.iata
+
+    return _normalise_place_mention(mention) or _normalise_place(raw_value)
+
+
+def _text_contains_token(text: str, token: str) -> bool:
+    return bool(re.search(rf"(?<![A-Za-z0-9]){re.escape(token)}(?![A-Za-z0-9])", text, re.IGNORECASE))
+
+
+def _text_contains_value(text: str, value: str) -> bool:
+    candidate = value.strip()
+    if not candidate:
+        return False
+    if re.fullmatch(r"[A-Za-z0-9]{3}", candidate):
+        return _text_contains_token(text, candidate)
+    return candidate.casefold() in text.casefold()
 
 
 def _infer_route_from_text(text: str) -> tuple[str | None, str | None]:

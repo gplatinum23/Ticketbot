@@ -10,7 +10,8 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_STATION_FILE = PROJECT_ROOT / "resources" / "station_name.js"
-DEFAULT_AIRPORT_FILE = PROJECT_ROOT / "resources" / "airports.csv"
+DEFAULT_AIRPORT_FILE = PROJECT_ROOT / "resources" / "airports_normalized_with_flight_potential.csv"
+FALLBACK_AIRPORT_FILE = PROJECT_ROOT / "resources" / "airports.csv"
 DEFAULT_AIRPORT_SUPPLEMENT_FILE = PROJECT_ROOT / "resources" / "airports.json"
 
 
@@ -32,6 +33,8 @@ class AirportRecord:
     latitude: float | None = None
     longitude: float | None = None
     city: str | None = None
+    flight_potential_score: float | None = None
+    flight_tier: str | None = None
 
 
 @dataclass(frozen=True)
@@ -128,7 +131,7 @@ class AirportIndex:
         if not query_terms:
             return None
 
-        best: tuple[int, AirportRecord] | None = None
+        best: tuple[tuple[int, float, int], AirportRecord] | None = None
         for airport in self.airports:
             if not _airport_matches_country(airport, query.country):
                 continue
@@ -143,8 +146,15 @@ class AirportIndex:
                 score += 3
             if query.name and _normalise_lookup_key(query.name) in airport_key:
                 score += 5
-            if best is None or score > best[0]:
-                best = (score, airport)
+            if score < 2:
+                continue
+            rank = (
+                score,
+                airport.flight_potential_score or 0.0,
+                _flight_tier_rank(airport.flight_tier),
+            )
+            if best is None or rank > best[0]:
+                best = (rank, airport)
         return best[1] if best is not None else None
 
 
@@ -184,10 +194,10 @@ def normalise_train_query_place(value: str) -> str | None:
 
     upper = text.upper()
     airport = get_airport_index().resolve(text)
-    if airport is not None and airport.iata in _AIRPORT_CITY_CODES:
-        return _TRAIN_CITY_BY_IATA.get(airport.iata)
     if airport is not None and airport.country != "CN" and upper in _SKIP_TRAIN_FOR_AIRPORT_CODES:
         return None
+    if airport is not None and airport.country == "CN":
+        return _TRAIN_CITY_BY_IATA.get(airport.iata) or station_city_for_airport(airport)
 
     station = get_station_index().resolve(text)
     if station is not None:
@@ -249,6 +259,8 @@ def _load_station_records(path: Path) -> list[StationRecord]:
 
 
 def _load_airport_records(path: Path) -> list[AirportRecord]:
+    if not path.exists():
+        path = FALLBACK_AIRPORT_FILE
     airports: list[AirportRecord] = []
     with path.open(encoding="utf-8", newline="") as handle:
         for row in csv.DictReader(handle):
@@ -265,6 +277,8 @@ def _load_airport_records(path: Path) -> list[AirportRecord]:
                     latitude=_parse_float(row.get("latitude_deg")),
                     longitude=_parse_float(row.get("longitude_deg")),
                     city=_derive_airport_city(name),
+                    flight_potential_score=_parse_float(row.get("flight_potential_score")),
+                    flight_tier=_normalise_flight_tier(row.get("flight_tier")),
                 )
             )
     existing_codes = {airport.iata for airport in airports}
@@ -303,6 +317,8 @@ def _load_airport_supplements(path: Path) -> list[AirportRecord]:
                 country=country,
                 region="",
                 city=str(row.get("city") or "").strip() or _derive_airport_city(name),
+                flight_potential_score=_parse_float(row.get("flight_potential_score")),
+                flight_tier=_normalise_flight_tier(row.get("flight_tier")),
             )
         )
     return airports
@@ -338,7 +354,11 @@ def _airport_query_terms(query: AirportQuery) -> list[str]:
         if not key:
             continue
         terms.append(key)
-        terms.extend(part for part in key.split(" ") if len(part) > 2)
+        terms.extend(
+            part
+            for part in key.split(" ")
+            if len(part) > 2 and part not in _AIRPORT_LOOKUP_STOPWORDS
+        )
     return list(dict.fromkeys(terms))
 
 
@@ -357,6 +377,17 @@ def _parse_float(value: str | None) -> float | None:
         return float(value)
     except ValueError:
         return None
+
+
+def _normalise_flight_tier(value: str | None) -> str | None:
+    if not value:
+        return None
+    text = value.strip().upper()
+    return text if text in {"T1", "T2", "T3", "T4"} else None
+
+
+def _flight_tier_rank(value: str | None) -> int:
+    return {"T1": 4, "T2": 3, "T3": 2, "T4": 1}.get(value or "", 0)
 
 
 def _derive_airport_city(name: str) -> str | None:
@@ -431,3 +462,12 @@ _VIRTUAL_AIRPORT_RECORDS = [
         city="Beijing",
     )
 ]
+
+_AIRPORT_LOOKUP_STOPWORDS = {
+    "airport",
+    "international",
+    "regional",
+    "domestic",
+    "city",
+    "airports",
+}

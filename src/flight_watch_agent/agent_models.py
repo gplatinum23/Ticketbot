@@ -49,6 +49,8 @@ class CandidateHub:
     strategies: list[TravelStrategy]
     priority: float
     reason: str
+    flight_potential_score: float | None = None
+    flight_tier: str | None = None
 
 
 @dataclass(frozen=True)
@@ -68,10 +70,10 @@ class QueryPlanItem:
 
 @dataclass(frozen=True)
 class QueryBudget:
-    max_hubs_per_strategy: int = 5
-    max_flight_queries: int = 10
-    max_train_queries: int = 10
-    max_total_routes: int = 30
+    max_hubs_per_strategy: int = 10
+    max_flight_queries: int = 50
+    max_train_queries: int = 50
+    max_total_routes: int = 150
 
 
 @dataclass(frozen=True)

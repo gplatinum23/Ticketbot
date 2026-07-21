@@ -14,6 +14,7 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
 
 from .models import FlightEvidence, FlightOption, FlightSearchIntent, SearchResult
+from .progress import ProgressReporter, get_progress_reporter
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,14 @@ class FlightEvidenceJudge(Protocol):
         """Judge and normalise extracted web evidence."""
 
 
+@dataclass(frozen=True)
+class FlightEvidenceJudgeRequest:
+    request_id: str
+    intent: FlightSearchIntent
+    search_result: SearchResult
+    evidence: list[FlightEvidence]
+
+
 class FlightEvidenceDecision(BaseModel):
     candidate_index: int = Field(description="Index of the candidate evidence being judged.")
     accept: bool = Field(description="Whether this candidate is a plausible flight price.")
@@ -60,10 +69,30 @@ class FlightEvidenceDecisionBatch(BaseModel):
     decisions: list[FlightEvidenceDecision] = Field(default_factory=list)
 
 
+class FlightEvidenceBatchDecision(FlightEvidenceDecision):
+    request_id: str = Field(description="Request identifier supplied with the candidate batch.")
+
+
+class FlightEvidenceBatchDecisionResult(BaseModel):
+    decisions: list[FlightEvidenceBatchDecision] = Field(default_factory=list)
+
+
+class FlightResponseDecision(BaseModel):
+    request_id: str = Field(description="Request identifier supplied with the captured response.")
+    accept: bool = Field(description="Whether the response plausibly matches the requested flight search.")
+    confidence: float = Field(ge=0, le=1)
+
+
+class FlightResponseDecisionBatch(BaseModel):
+    decisions: list[FlightResponseDecision] = Field(default_factory=list)
+
+
 class LlmFlightEvidenceJudge:
-    def __init__(self, llm, *, min_confidence: float = 0.65) -> None:
+    def __init__(self, llm, *, min_confidence: float = 0.65, max_batch_evidence: int = 25) -> None:
         self.llm = llm
         self.min_confidence = min_confidence
+        self.max_batch_evidence = max_batch_evidence
+        self.last_batch_count = 0
 
     def judge(
         self,
@@ -74,7 +103,6 @@ class LlmFlightEvidenceJudge:
     ) -> list[FlightEvidence]:
         if not evidence:
             return []
-
         structured_llm = self.llm.with_structured_output(FlightEvidenceDecisionBatch)
         result = structured_llm.invoke(
             [
@@ -100,6 +128,71 @@ class LlmFlightEvidenceJudge:
             intent=intent,
             min_confidence=self.min_confidence,
         )
+
+    def judge_many(
+        self,
+        requests: list[FlightEvidenceJudgeRequest],
+    ) -> dict[str, list[FlightEvidence]]:
+        judged = {request.request_id: [] for request in requests}
+        non_empty = [request for request in requests if request.evidence]
+        self.last_batch_count = 0
+        compact_requests = [request for request in non_empty if _is_structured_ctrip_request(request)]
+        detailed_requests = [request for request in non_empty if request not in compact_requests]
+
+        for request_batch in _chunk_requests_by_count(compact_requests, self.max_batch_evidence):
+            self.last_batch_count += 1
+            structured_llm = self.llm.with_structured_output(FlightResponseDecisionBatch)
+            result = structured_llm.invoke(
+                [
+                    ("system", _flight_response_batch_judge_prompt()),
+                    ("human", _format_response_batch_judge_input(request_batch)),
+                ]
+            )
+            batch = (
+                result
+                if isinstance(result, FlightResponseDecisionBatch)
+                else FlightResponseDecisionBatch.model_validate(result)
+            )
+            decision_by_request = {decision.request_id: decision for decision in batch.decisions}
+            for request in request_batch:
+                decision = decision_by_request.get(request.request_id)
+                if decision is None or not decision.accept or decision.confidence < self.min_confidence:
+                    continue
+                judged[request.request_id].extend(
+                    item for item in request.evidence if _matches_intent(item, request.intent)
+                )
+
+        for request_batch in _chunk_judge_requests(detailed_requests, self.max_batch_evidence):
+            self.last_batch_count += 1
+            structured_llm = self.llm.with_structured_output(FlightEvidenceBatchDecisionResult)
+            result = structured_llm.invoke(
+                [
+                    ("system", _flight_evidence_batch_judge_prompt()),
+                    ("human", _format_batch_judge_input(request_batch)),
+                ]
+            )
+            batch = (
+                result
+                if isinstance(result, FlightEvidenceBatchDecisionResult)
+                else FlightEvidenceBatchDecisionResult.model_validate(result)
+            )
+            decisions_by_request: dict[str, list[FlightEvidenceDecision]] = defaultdict(list)
+            for decision in batch.decisions:
+                decisions_by_request[decision.request_id].append(
+                    FlightEvidenceDecision.model_validate(
+                        decision.model_dump(exclude={"request_id"})
+                    )
+                )
+            for request in request_batch:
+                judged[request.request_id].extend(
+                    _apply_evidence_decisions(
+                        evidence=request.evidence,
+                        decisions=decisions_by_request.get(request.request_id, []),
+                        intent=request.intent,
+                        min_confidence=self.min_confidence,
+                    )
+                )
+        return judged
 
 
 class FlightEvidenceVerifier:
@@ -327,14 +420,17 @@ def build_react_flight_search_graph(
     evidence_judge: FlightEvidenceJudge | None = None,
     verifier: FlightEvidenceVerifier | None = None,
     max_iterations: int = 3,
+    progress_reporter: ProgressReporter | None = None,
 ):
     evidence_verifier = verifier or FlightEvidenceVerifier()
+    progress = get_progress_reporter(progress_reporter)
     graph = StateGraph(ReactFlightSearchState)
 
     def generate_search_plan(state: ReactFlightSearchState) -> ReactFlightSearchState:
         iteration = state.get("iteration", 0) + 1
         max_iters = state.get("max_iterations", max_iterations)
         query = _build_search_query(state["intent"], iteration)
+        progress.emit(f"生成机票搜索计划，第 {iteration}/{max_iters} 轮...")
         return {
             **state,
             "iteration": iteration,
@@ -344,6 +440,7 @@ def build_react_flight_search_graph(
         }
 
     def run_web_search(state: ReactFlightSearchState) -> ReactFlightSearchState:
+        progress.emit(f"搜索公开机票页面: {state['current_query']}")
         warnings = list(state.get("warnings", []))
         raw_results = list(state.get("raw_results", []))
         try:
@@ -356,6 +453,7 @@ def build_react_flight_search_graph(
         return {**state, "raw_results": _dedupe_results(raw_results), "warnings": warnings}
 
     def extract_pages(state: ReactFlightSearchState) -> ReactFlightSearchState:
+        progress.emit("抽取机票页面价格信息...")
         warnings = list(state.get("warnings", []))
         evidence = list(state.get("extracted_evidence", []))
         seen_urls = set(state.get("_extracted_urls", []))
@@ -382,6 +480,7 @@ def build_react_flight_search_graph(
         }
 
     def judge_evidence(state: ReactFlightSearchState) -> ReactFlightSearchState:
+        progress.emit("判断机票证据是否匹配...")
         if evidence_judge is None:
             return {**state, "judged_evidence": state.get("extracted_evidence", [])}
 
@@ -412,6 +511,7 @@ def build_react_flight_search_graph(
         return {**state, "judged_evidence": judged, "warnings": warnings}
 
     def verify_options(state: ReactFlightSearchState) -> ReactFlightSearchState:
+        progress.emit("聚合可用机票候选...")
         evidence = state.get("judged_evidence", state.get("extracted_evidence", []))
         options = evidence_verifier.verify(evidence, state["intent"])
         warnings = list(state.get("warnings", []))
@@ -527,7 +627,112 @@ Accept a candidate only when it is plausibly a flight ticket price for the reque
 Reject hotel prices, ads, generic package prices, unrelated routes, wrong dates, and missing prices.
 Use the user's requested route/date when the page evidence is clearly about that same query.
 Return only structured decisions. Do not include hidden reasoning.
+    """.strip()
+
+
+def _flight_evidence_batch_judge_prompt() -> str:
+    return """
+You judge batches of public web evidence for flight ticket prices.
+
+For every candidate, copy request_id and candidate_index into the decision.
+Accept a candidate only when it plausibly matches that request's route and date.
+Reject hotel prices, ads, packages, unrelated routes, wrong dates, and missing prices.
+Use each request's requested_trip independently; never mix candidates between requests.
+Return only structured decisions. Do not include hidden reasoning.
 """.strip()
+
+
+def _flight_response_batch_judge_prompt() -> str:
+    return """
+You judge captured Ctrip flight-search responses for requested routes.
+
+Return exactly one decision per request_id with only request_id, accept, and confidence.
+Accept when the structured response plausibly contains ticket options for that request's route and date.
+Reject responses with a mismatched route/date, missing prices, or content that is not flight inventory.
+The application will validate every itinerary's fields and time preference after this response-level decision.
+Return only structured decisions. Do not include hidden reasoning.
+""".strip()
+
+
+def _chunk_judge_requests(
+    requests: list[FlightEvidenceJudgeRequest],
+    max_batch_evidence: int,
+) -> list[list[FlightEvidenceJudgeRequest]]:
+    limit = max(1, max_batch_evidence)
+    batches: list[list[FlightEvidenceJudgeRequest]] = []
+    current: list[FlightEvidenceJudgeRequest] = []
+    current_size = 0
+    for request in requests:
+        request_size = len(request.evidence)
+        if current and current_size + request_size > limit:
+            batches.append(current)
+            current = []
+            current_size = 0
+        current.append(request)
+        current_size += request_size
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _chunk_requests_by_count(
+    requests: list[FlightEvidenceJudgeRequest],
+    limit: int,
+) -> list[list[FlightEvidenceJudgeRequest]]:
+    size = max(1, limit)
+    return [requests[index:index + size] for index in range(0, len(requests), size)]
+
+
+def _format_batch_judge_input(requests: list[FlightEvidenceJudgeRequest]) -> str:
+    payload = []
+    for request in requests:
+        request_payload = json.loads(
+            _format_judge_input(
+                intent=request.intent,
+                search_result=request.search_result,
+                evidence=request.evidence,
+            )
+        )
+        request_payload["request_id"] = request.request_id
+        payload.append(request_payload)
+    return json.dumps({"requests": payload}, ensure_ascii=False)
+
+
+def _format_response_batch_judge_input(requests: list[FlightEvidenceJudgeRequest]) -> str:
+    payload: list[dict[str, object]] = []
+    for request in requests:
+        prices = [item.price for item in request.evidence if item.price is not None]
+        payload.append(
+            {
+                "request_id": request.request_id,
+                "requested_trip": {
+                    "origin": request.intent.origin,
+                    "destination": request.intent.destination,
+                    "travel_date": request.intent.travel_date.isoformat(),
+                    "currency": request.intent.currency,
+                },
+                "source_name": request.search_result.source_name,
+                "url": request.search_result.url,
+                "itinerary_count": len(request.evidence),
+                "observed_origins": sorted({item.origin for item in request.evidence if item.origin}),
+                "observed_destinations": sorted({item.destination for item in request.evidence if item.destination}),
+                "observed_dates": sorted(
+                    {item.travel_date.isoformat() for item in request.evidence if item.travel_date}
+                ),
+                "minimum_price": min(prices) if prices else None,
+                "maximum_price": max(prices) if prices else None,
+            }
+        )
+    return json.dumps({"requests": payload}, ensure_ascii=False)
+
+
+def _is_structured_ctrip_request(request: FlightEvidenceJudgeRequest) -> bool:
+    return bool(request.evidence) and all(
+        item.source_name == "flights.ctrip.com"
+        and isinstance(item.metadata, dict)
+        and bool(item.metadata.get("segments"))
+        for item in request.evidence
+    )
 
 
 def _format_judge_input(

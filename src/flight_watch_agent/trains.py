@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import threading
 import time
+import atexit
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -29,56 +30,96 @@ class StdioMcpToolClient:
         self.command = command or _default_mcp_command()
         self.args = args or _default_mcp_args()
         self.timeout_seconds = timeout_seconds
+        self._lock = threading.RLock()
+        self._proc: subprocess.Popen | None = None
+        self._stderr_lines: list[str] = []
+        self._stderr_thread: threading.Thread | None = None
+        self._initialized = False
+        self._next_request_id = 1
+        atexit.register(self.close)
 
     def call_tool(self, name: str, arguments: dict) -> Any:
-        proc = self._start_process()
-        stderr_lines: list[str] = []
-        stderr_thread = threading.Thread(
+        with self._lock:
+            proc = self._ensure_process()
+            try:
+                if not self._initialized:
+                    initialize_id = self._request_id()
+                    self._send(
+                        proc,
+                        {
+                            "jsonrpc": "2.0",
+                            "id": initialize_id,
+                            "method": "initialize",
+                            "params": {
+                                "protocolVersion": "2025-06-18",
+                                "capabilities": {},
+                                "clientInfo": {
+                                    "name": "flight-watch-agent",
+                                    "version": "0.1.0",
+                                },
+                            },
+                        },
+                    )
+                    self._read_response(proc, self._stderr_lines)
+                    self._send(
+                        proc,
+                        {
+                            "jsonrpc": "2.0",
+                            "method": "notifications/initialized",
+                            "params": {},
+                        },
+                    )
+                    self._initialized = True
+
+                request_id = self._request_id()
+                self._send(
+                    proc,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "method": "tools/call",
+                        "params": {"name": name, "arguments": arguments},
+                    },
+                )
+                response = self._read_response(proc, self._stderr_lines)
+                return _extract_tool_json(response)
+            except Exception:
+                self.close()
+                raise
+
+    def close(self) -> None:
+        with self._lock:
+            proc = self._proc
+            self._proc = None
+            self._stderr_lines = []
+            self._stderr_thread = None
+            self._initialized = False
+            self._next_request_id = 1
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def _ensure_process(self) -> subprocess.Popen:
+        if self._proc is not None and self._proc.poll() is None:
+            return self._proc
+        self._proc = self._start_process()
+        self._stderr_lines = []
+        self._stderr_thread = threading.Thread(
             target=_drain_stderr,
-            args=(proc, stderr_lines),
+            args=(self._proc, self._stderr_lines),
             daemon=True,
         )
-        stderr_thread.start()
+        self._stderr_thread.start()
+        self._initialized = False
+        self._next_request_id = 1
+        return self._proc
 
-        try:
-            self._send(
-                proc,
-                {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "initialize",
-                    "params": {
-                        "protocolVersion": "2025-06-18",
-                        "capabilities": {},
-                        "clientInfo": {
-                            "name": "flight-watch-agent",
-                            "version": "0.1.0",
-                        },
-                    },
-                },
-            )
-            self._read_response(proc, stderr_lines)
-            self._send(
-                proc,
-                {
-                    "jsonrpc": "2.0",
-                    "method": "notifications/initialized",
-                    "params": {},
-                },
-            )
-            self._send(
-                proc,
-                {
-                    "jsonrpc": "2.0",
-                    "id": 2,
-                    "method": "tools/call",
-                    "params": {"name": name, "arguments": arguments},
-                },
-            )
-            response = self._read_response(proc, stderr_lines)
-            return _extract_tool_json(response)
-        finally:
-            proc.kill()
+    def _request_id(self) -> int:
+        request_id = self._next_request_id
+        self._next_request_id += 1
+        return request_id
 
     def _start_process(self) -> subprocess.Popen:
         env = os.environ.copy()

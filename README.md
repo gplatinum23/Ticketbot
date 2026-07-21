@@ -1,71 +1,193 @@
 ﻿# Flight Watch Agent
 
-涓€涓熀浜?LangGraph 鐨勫疄鏃跺嚭琛岃鍒掓鏋躲€傚綋鍓嶄繚鐣欎袱绉嶅叆鍙ｏ細
+Flight Watch Agent 是一个基于 LangGraph 的实时综合出行规划 Agent。用户可以使用自然语言或结构化参数输入出发地、目的地、日期、时间偏好和预算，系统会查询火车与机票，并比较直达和两段式组合路线。
 
-- `plan-flight`: 缁撴瀯鍖栧弬鏁版煡璇?12306 鐏溅鍊欓€夛紝骞堕€氳繃 Web Search 鎼滅储鍏紑鏈虹エ鍊欓€夈€?- `ask`: 浣跨敤 LLM 浠庤嚜鐒惰瑷€涓В鏋愬嚭琛岄渶姹傦紝鍐嶈皟鐢ㄥ悓涓€鏉¤鍒掓祦绋嬨€?
-闀挎湡鏈虹エ浠锋牸鐩戞帶銆丼QLite 鐩戞帶浠诲姟銆侀槇鍊奸€氱煡鍜?mock 闀挎湡鏌ヤ环鍔熻兘宸茬粡绉婚櫎銆?
-## 鐜
+## 主要功能
 
-椤圭洰鎸?`agent_env` 铏氭嫙鐜浣跨敤锛?
+- 使用 LLM 解析自然语言出行需求。
+- 通过 `12306-mcp` 查询火车车次、余票和票价。
+- 通过携程公开页面和 SeleniumWire 获取机票信息，不依赖官方机票 API。
+- 支持直达、火车加飞机、飞机加火车、火车加火车、飞机加飞机路线。
+- 使用规则与 LLM 共同生成中转 Hub，并通过本地机场和火车站索引校验。
+- 综合价格、总耗时、航段数、换乘时间和用户偏好输出 Top 5。
+
+## 系统架构
+
+```mermaid
+flowchart TD
+    CLI[CLI: ask / plan-flight]
+
+    CLI -->|ask| RequestGraph[自然语言请求图]
+    CLI -->|plan-flight| TravelGraph[出行规划图]
+
+    RequestGraph --> ParseIntent[LLM 解析出行意图]
+    ParseIntent --> CheckIntent{字段是否完整}
+    CheckIntent -->|否| Clarify[返回追问]
+    CheckIntent -->|是| TravelGraph
+
+    TravelGraph --> Classify[classify_region<br/>区域分类]
+    Classify --> Strategy[select_strategies<br/>策略选择]
+
+    Strategy --> Hub[generate_candidate_hubs<br/>规则 Top 5 + LLM Top 5]
+    Strategy --> DirectFlight[prefetch_direct_flight<br/>并行查询直达机票]
+
+    AirportIndex[(机场索引)] -.-> Hub
+    StationIndex[(12306 站点索引)] -.-> Hub
+    Hub --> ValidateHub[validate_candidate_hubs<br/>起终点与 Hub 校验]
+    DirectFlight --> ValidateHub
+
+    ValidateHub --> QueryPlan[build_query_plan<br/>生成查询计划]
+    QueryPlan --> Execute[execute_query_plan<br/>执行并复用唯一查询]
+
+    Execute --> TrainProvider[12306 MCP]
+    Execute --> FlightProvider[携程页面 + SeleniumWire]
+    FlightProvider --> Evidence[LLM 机票证据判断]
+
+    TrainProvider --> RouteBuilder[build_candidate_routes<br/>组合候选路线]
+    Evidence --> RouteBuilder
+    RouteBuilder --> Rank[rank_routes<br/>LLM 排序 + 确定性纠错]
+    Rank --> Result[Top 5 推荐结果]
+```
+
+项目包含两个 LangGraph：
+
+- **自然语言请求图**：解析 `ask` 输入，检查必填字段并决定追问或进入规划。
+- **出行规划图**：选择策略、生成 Hub、执行查询、组合路线并完成排序。
+
+## 路线策略
+
+当前支持六种策略：
+
+| 策略 | 含义 |
+| --- | --- |
+| `direct_flight` | 机票直达查询，结果可能是航司联程产品 |
+| `direct_train` | 直达火车 |
+| `train_flight` | 火车后转飞机 |
+| `flight_train` | 飞机后转火车 |
+| `train_train` | 两段火车 |
+| `flight_flight` | 两张独立机票组合 |
+
+组合搜索目前限制为两条查询边。携程返回的一张联程机票可能包含多个物理航班，因此 `Flight A+B` 表示一个含中转的机票产品，并非真正直飞。
+
+## 环境安装
+
+要求：
+
+- Python 3.11+
+- Node.js LTS，以及可用的 `node`、`npm`、`npx`
+- Microsoft Edge 或 Chrome
+
 ```powershell
 python -m venv agent_env
 .\agent_env\Scripts\Activate.ps1
-python -m pip install -e ".[dev]"
+python -m pip install -e ".[dev,ctrip]"
 ```
 
-## 閰嶇疆
+火车查询默认启动：
 
-榛樿浼氳鍙栭」鐩牴鐩綍鐨?`.env` 鏂囦欢銆傚彲浠ヤ粠 `.env.example` 澶嶅埗涓€浠斤細
+```powershell
+npx -y 12306-mcp
+```
+
+## 配置
+
+复制配置模板：
 
 ```powershell
 Copy-Item .env.example .env
 ```
 
-鐒跺悗鍦?`.env` 涓～鍐欙細
+常用配置：
 
 ```dotenv
 OPENAI_API_KEY=your-api-key
 FLIGHT_WATCH_LLM_MODEL=openai:gpt-4.1-mini
+FLIGHT_WATCH_FAST_LLM_MODEL=openai:gpt-4.1-mini
+FLIGHT_WATCH_ROUTE_LLM_MODEL=
+
 FLIGHT_WATCH_12306_MCP_COMMAND=
 FLIGHT_WATCH_12306_MCP_ARGS=
-FLIGHT_WATCH_12306_DEBUG=false
+
+FLIGHT_WATCH_CTRIP_BROWSER=edge
+FLIGHT_WATCH_CTRIP_HEADLESS=false
+FLIGHT_WATCH_CTRIP_LOGIN_ALLOWED=true
+FLIGHT_WATCH_CTRIP_USERNAME=
+FLIGHT_WATCH_CTRIP_PASSWORD=
+FLIGHT_WATCH_CTRIP_COOKIES_FILE=data/ctrip_cookies.json
+FLIGHT_WATCH_CTRIP_MANUAL_VERIFICATION_WAIT_SECONDS=120
+FLIGHT_WATCH_CTRIP_REUSE_BROWSER=true
 ```
 
-12306 默认通过 `npx -y 12306-mcp` 启动，需要本机可用 Node.js/npm/npx。通常不需要填写 `FLIGHT_WATCH_12306_MCP_COMMAND` 和 `FLIGHT_WATCH_12306_MCP_ARGS`；只有当你想使用自定义 MCP 启动命令时才需要配置。
-绯荤粺鐜鍙橀噺浼樺厛浜?`.env`銆傚鏋滆鎸囧畾鍏朵粬 env 鏂囦欢锛?
+模型分工：
+
+- `FLIGHT_WATCH_LLM_MODEL`：基础模型。
+- `FLIGHT_WATCH_FAST_LLM_MODEL`：意图解析、Hub 规划、机票证据判断和默认路线排序。
+- `FLIGHT_WATCH_ROUTE_LLM_MODEL`：可选的独立路线排序模型；留空时使用快速模型。
+
+携程出现人工验证码时，需要使用非无头浏览器，并设置足够的人工验证等待时间。登录成功后的 Cookie 会保存到 `FLIGHT_WATCH_CTRIP_COOKIES_FILE`。
+
+系统环境变量优先于 `.env`。可以通过 `FLIGHT_WATCH_ENV_FILE` 指定其他配置文件。
+
+## 快速使用
+
+激活虚拟环境后，可以直接使用 `flight-watch`；下面的命令也适用于未激活环境。
+
+### 自然语言规划
+
 ```powershell
-$env:FLIGHT_WATCH_ENV_FILE="config/local.env"
+.\agent_env\Scripts\flight-watch.exe ask `
+  "帮我查一下 2026-08-15 成都到新加坡，上午出发，预算 3000 以内的方案"
 ```
 
-## 浣跨敤
-
-缁撴瀯鍖栧弬鏁版煡璇?12306 鐏溅鍊欓€夊拰鍏紑鏈虹エ鍊欓€夛細
+只查询机票：
 
 ```powershell
-flight-watch plan-flight --origin BJP --destination SHH --travel-date 2026-07-09 --time-preference morning --budget 1200
+.\agent_env\Scripts\flight-watch.exe ask `
+  "帮我查一下 2026-08-15 成都到新加坡的方案" `
+  --flight-only
 ```
 
-鑷劧璇█瑙勫垝锛?
-```powershell
-flight-watch ask "甯垜鏌ヤ竴涓?2026-07-09 鍖椾含鍒颁笂娴凤紝涓婂崍鍑哄彂锛岄绠?1200 浠ュ唴鐨勬柟妗?
-```
-
-鍗曠嫭璋冭瘯鍏紑椤甸潰鏈虹エ鎼滅储锛屼笉鏌ヨ鐏溅銆佷笉鍋氳矾绾挎帓搴忥細
+### 结构化参数规划
 
 ```powershell
-flight-watch debug-flight-search --origin SIN --destination TFU --travel-date 2026-07-09 --max-iterations 1 --no-llm-judge
+.\agent_env\Scripts\flight-watch.exe plan-flight `
+  --origin CTU `
+  --destination SIN `
+  --travel-date 2026-08-15 `
+  --time-preference morning `
+  --budget 3000 `
+  --currency CNY
 ```
 
-鍘绘帀 `--no-llm-judge` 鍚庝細鎺ュ叆 LLM 鍒ゆ柇缃戦〉鎶藉彇缁撴灉锛涜皟璇曡緭鍑哄寘鍚?`search_queries`銆乣raw_results`銆乣extracted_evidence`銆乣judged_evidence`銆乣verified_flight_options` 鍜?`warnings`銆?
-鍗曠嫭璋冭瘯鎼虹▼ SeleniumWire 鐖櫕璺緞锛?
+`ask` 和 `plan-flight` 默认在标准错误流显示运行进度。使用 `--quiet` 可关闭进度，使用 `--show-flight-raw` 可附加输出机票搜索状态。
+
+### 单独调试机票搜索
+
 ```powershell
-python -m pip install -e ".[ctrip]"
-flight-watch debug-flight-search --origin SIN --destination TFU --travel-date 2026-07-09 --max-iterations 1 --no-llm-judge
+.\agent_env\Scripts\flight-watch.exe debug-flight-search `
+  --origin CTU `
+  --destination SIN `
+  --travel-date 2026-08-15 `
+  --max-iterations 1
 ```
 
-鎼虹▼璺緞鍙傝€?`Suysker/Ctrip-Crawler` 鐨勫仛娉曪細鍚姩娴忚鍣ㄣ€佽闂惡绋嬫満绁ㄩ〉闈€佹崟鑾?`/international/search/api/search/batchSearch` 鍝嶅簲锛屽啀瑙ｆ瀽 `flightItineraryList` 鍜?`priceList`銆傝繖鏉¤矾寰勪緷璧栨湰鏈烘祻瑙堝櫒/椹卞姩銆丼eleniumWire 璇佷功浠ｇ悊鍜屾惡绋嬮〉闈㈤鎺э紱濡傞渶瑙傚療椤甸潰浜や簰锛屽彲璁剧疆 `FLIGHT_WATCH_CTRIP_HEADLESS=false`銆?
-`plan-flight` 会先通过本地 `12306-mcp` 调用 12306 的 `get-tickets`，一次性获取火车余票和官网展示价；随后执行最多 3 轮“生成搜索词 -> Web Search -> 页面抽取 -> LLM 证据判断 -> 候选归一化”的 ReAct 机票搜索循环。机票价格不调用官方机票 API，只来自公开网页搜索、页面抽取或携程 SeleniumWire 捕获；LLM 只负责判断网页抽取结果是否像有效机票证据、过滤错误价格并做字段归一化。当前阶段单个可用来源即可进入推荐结果；价格会标注为公开页面估算价，不保证最终可购价。
-鏈虹エ鎼滅储浼氫紭鍏堝皾璇曟瀯閫?Skyscanner route 椤甸潰锛屼緥濡?`https://www.skyscanner.com.sg/routes/sin/tfu/singapore-changi-to-chengdu-tianfu-international.html`锛屽啀琛ュ厖 DuckDuckGo 鎼滅储缁撴灉銆係kyscanner route 椤甸潰閫氬父鏄?JavaScript 搴旂敤澹筹紝褰撳墠 HTTP 椤甸潰鎶藉彇鍣ㄤ笉淇濊瘉鑳界洿鎺ヨ鍒颁环鏍笺€?
-## 褰撳墠杈圭晫
+添加 `--no-llm-judge` 可以跳过 LLM 证据判断，仅检查页面抓取与结构化解析。
 
-- 火车查询来自本地 `12306-mcp`，通过 `get-tickets` 返回余票和官网展示价。- 机票搜索来自公开 Web Search、页面抽取和 LLM 证据判断，不是官方机票 API。- 当前输出火车候选和 verified flight candidate；完整“火车 + 飞机”多段组合与路线评分后续再补。- `ask` 和默认 `plan-flight` 都需要配置可用的 LLM API key；`ask` 用于解析自然语言，`plan-flight` 的机票 ReAct 节点用于判断网页证据。
+## 数据与排序
+
+本地地点索引：
+
+- `resources/station_name.js`：12306 火车站名称与 telecode。
+- `resources/airports_normalized_with_flight_potential.csv`：机场、城市、IATA、机场等级和航班潜力。
+- `resources/airports.csv`、`resources/airports.json`：机场索引补充数据。
+
+国际路线的规则 Hub 默认选择 `T1/T2` 且 `flight_potential_score >= 0.50` 的机场城市。系统生成规则候选 Top 5 和 LLM 候选 Top 5，随后过滤起终点同城 Hub 和无法通过本地索引校验的地点。
+
+最终排序分为两步：LLM 根据总价、门到门耗时、实际航段数、换乘等待和用户偏好排序；确定性规则随后纠正明显反常的顺序。如果路线 A 同时不比路线 B 更贵、更慢或更复杂，并至少有一项严格更优，A 必须排在 B 前面。
+
+## 测试
+
+```powershell
+.\agent_env\Scripts\python.exe -m pytest -q
+```
+

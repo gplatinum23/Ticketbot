@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 import json
+from concurrent.futures import ThreadPoolExecutor
 from typing import Protocol, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -20,19 +21,27 @@ from .agent_models import (
 from .agent_nodes import (
     build_query_plan as build_agent_query_plan,
     classify_region as classify_agent_region,
-    generate_candidate_hubs_for_places,
+    generate_candidate_hubs_for_place_mentions,
     generate_candidate_hubs as generate_agent_candidate_hubs,
     select_strategies as select_agent_strategies,
 )
 from .flight_react import (
     FlightEvidenceJudge,
+    FlightEvidenceJudgeRequest,
     FlightEvidenceVerifier,
     PageExtractor,
     WebSearchTool,
     build_react_flight_search_graph,
 )
-from .models import FlightOption, FlightSearchIntent, TrainOption
-from .places import normalise_airport_code
+from .models import FlightOption, FlightSearchIntent, SearchResult, TrainOption
+from .places import (
+    get_airport_index,
+    get_station_index,
+    normalise_airport_code,
+    normalise_train_query_place,
+    station_city_for_airport,
+)
+from .progress import ProgressReporter, get_progress_reporter
 
 
 class TrainProvider(Protocol):
@@ -50,6 +59,54 @@ class RoutePlanner(Protocol):
         """Return routes sorted by LLM route planning preference."""
 
 
+class HubProposer(Protocol):
+    def propose(
+        self,
+        *,
+        user_input: str,
+        intent: FlightSearchIntent,
+        region_info: RegionInfo,
+        strategy_selection: StrategySelection,
+        index_hubs: list[CandidateHub],
+    ) -> list[object]:
+        """Return structured hub suggestions for local index resolution."""
+
+
+class HubEndpointValidator(Protocol):
+    def validate(
+        self,
+        *,
+        user_input: str,
+        intent: FlightSearchIntent,
+        region_info: RegionInfo,
+        candidate_hubs: list[CandidateHub],
+    ) -> list["HubEndpointDecision"]:
+        """Return endpoint identity decisions and optional hub corrections."""
+
+
+class HubPlanner(Protocol):
+    def plan(
+        self,
+        *,
+        user_input: str,
+        intent: FlightSearchIntent,
+        region_info: RegionInfo,
+        strategy_selection: StrategySelection,
+        index_hubs: list[CandidateHub],
+        supplemental_hubs: list[CandidateHub],
+        explicit_hubs: list[CandidateHub],
+    ) -> "HubPlanningBatch":
+        """Propose supplemental hubs and validate existing hubs in one LLM call."""
+
+
+@dataclass(frozen=True)
+class EndpointIdentity:
+    label: str
+    cities: frozenset[str]
+    airport_codes: frozenset[str]
+    train_places: frozenset[str]
+
+
 @dataclass(frozen=True)
 class CandidateRoute:
     route_id: str
@@ -62,14 +119,22 @@ class CandidateRoute:
     transfer_city: str | None = None
     transfer_airport: str | None = None
     transfer_wait_minutes: int | None = None
+    total_duration_minutes: int | None = None
+    segment_count: int | None = None
     score: float | None = None
 
 
 class TravelPlanState(TypedDict, total=False):
+    user_input: str
     intent: FlightSearchIntent
+    explicit_hub_places: list[object]
     region_info: RegionInfo
     strategy_selection: StrategySelection
+    index_candidate_hubs: list[CandidateHub]
+    llm_candidate_hubs: list[CandidateHub]
     candidate_hubs: list[CandidateHub]
+    endpoint_validated_hubs: list[CandidateHub]
+    hub_endpoint_decisions: list["HubEndpointDecision"]
     query_plan: QueryPlan
     route_edges: list[RouteEdge]
     train_options: list[TrainOption]
@@ -78,6 +143,8 @@ class TravelPlanState(TypedDict, total=False):
     transfer_flight_options: list[FlightOption]
     flight_search_debug: dict[str, object]
     transfer_search_debug: dict[str, object]
+    prefetched_direct_flight_state: dict[str, object]
+    query_execution_stats: dict[str, int]
     candidate_routes: list[CandidateRoute]
     response: str
     warnings: list[str]
@@ -91,20 +158,45 @@ def build_travel_plan_graph(
     evidence_judge: FlightEvidenceJudge | None = None,
     verifier: FlightEvidenceVerifier | None = None,
     route_planner: RoutePlanner | None = None,
+    hub_planner: HubPlanner | None = None,
+    hub_proposer: HubProposer | None = None,
+    hub_endpoint_validator: HubEndpointValidator | None = None,
+    progress_reporter: ProgressReporter | None = None,
     transfer_hubs: list[str] | None = None,
 ):
+    progress = get_progress_reporter(progress_reporter)
+    evidence_verifier = verifier or FlightEvidenceVerifier()
+    batch_evidence_judge = (
+        evidence_judge
+        if callable(getattr(evidence_judge, "judge_many", None))
+        else None
+    )
     react_search = build_react_flight_search_graph(
         web_search=web_search,
         page_extractor=page_extractor,
-        evidence_judge=evidence_judge,
-        verifier=verifier,
+        evidence_judge=None if batch_evidence_judge is not None else evidence_judge,
+        verifier=evidence_verifier,
+        progress_reporter=progress,
+    )
+    fallback_react_search = (
+        build_react_flight_search_graph(
+            web_search=web_search,
+            page_extractor=page_extractor,
+            evidence_judge=evidence_judge,
+            verifier=evidence_verifier,
+            progress_reporter=progress,
+        )
+        if batch_evidence_judge is not None
+        else react_search
     )
     graph = StateGraph(TravelPlanState)
 
     def classify_region(state: TravelPlanState) -> TravelPlanState:
+        progress.emit("判断出发地和目的地区域...")
         return {**state, "region_info": classify_agent_region(state["intent"])}
 
     def select_strategies(state: TravelPlanState) -> TravelPlanState:
+        progress.emit("选择可用出行策略...")
         return {
             **state,
             "strategy_selection": select_agent_strategies(
@@ -113,31 +205,143 @@ def build_travel_plan_graph(
             ),
         }
 
+    def prefetch_direct_flight(state: TravelPlanState) -> TravelPlanState:
+        if hub_planner is None or "direct_flight" not in state["strategy_selection"].enabled:
+            return {}
+        progress.emit("并行查询直达机票...")
+        return {
+            "prefetched_direct_flight_state": react_search.invoke({"intent": state["intent"]})
+        }
+
     def generate_candidate_hubs(state: TravelPlanState) -> TravelPlanState:
-        hubs = generate_agent_candidate_hubs(
+        progress.emit("生成候选中转城市...")
+        candidate_budget = QueryBudget(max_hubs_per_strategy=30, max_flight_queries=50, max_train_queries=50)
+        merge_budget = QueryBudget(max_hubs_per_strategy=10, max_flight_queries=50, max_train_queries=50)
+        index_hubs = generate_agent_candidate_hubs(
             state["intent"],
             state["strategy_selection"],
-            budget=QueryBudget(max_hubs_per_strategy=50, max_flight_queries=50, max_train_queries=50)
+            budget=QueryBudget(max_hubs_per_strategy=250, max_flight_queries=250, max_train_queries=250)
             if transfer_hubs is not None
-            else None,
+            else candidate_budget,
         )
+        rule_hubs = index_hubs[:5]
+        supplemental_hubs = index_hubs[5:20]
+        progress.emit(_format_hub_progress("规则候选 hub", rule_hubs, limit=5))
+        progress.emit(_format_hub_progress("原始候选 hub", index_hubs, limit=10))
+        explicit_places = list(state.get("explicit_hub_places", []))
         if transfer_hubs is not None:
-            allowed = set(_dedupe_hubs(transfer_hubs))
-            hubs = [
-                hub
-                for hub in hubs
-                if any(code in allowed for code in hub.airport_codes)
-                or hub.hub_id.upper() in allowed
-            ]
-            explicit_hubs = generate_candidate_hubs_for_places(
-                transfer_hubs,
-                state["strategy_selection"],
+            explicit_places.extend(transfer_hubs)
+
+        explicit_hubs, explicit_warnings = generate_candidate_hubs_for_place_mentions(
+            explicit_places,
+            state["strategy_selection"],
+        )
+        if explicit_hubs:
+            progress.emit(_format_hub_progress("显式候选 hub", explicit_hubs))
+        if transfer_hubs is not None:
+            index_hubs = []
+            rule_hubs = []
+            supplemental_hubs = []
+
+        llm_hubs: list[CandidateHub] = []
+        llm_warnings: list[str] = []
+        endpoint_decisions: list[HubEndpointDecision] = []
+        if hub_planner is not None and transfer_hubs is None:
+            try:
+                hub_plan = hub_planner.plan(
+                    user_input=state.get("user_input", ""),
+                    intent=state["intent"],
+                    region_info=state["region_info"],
+                    strategy_selection=state["strategy_selection"],
+                    index_hubs=rule_hubs,
+                    supplemental_hubs=supplemental_hubs,
+                    explicit_hubs=explicit_hubs,
+                )
+                llm_hubs, llm_warnings = generate_candidate_hubs_for_place_mentions(
+                    hub_plan.suggestions[:5],
+                    state["strategy_selection"],
+                )
+                endpoint_decisions = list(hub_plan.decisions)
+            except Exception as exc:
+                llm_warnings.append(f"llm_hub_planning_failed:{exc}")
+        elif hub_proposer is not None and transfer_hubs is None:
+            try:
+                suggestions = hub_proposer.propose(
+                    user_input=state.get("user_input", ""),
+                    intent=state["intent"],
+                    region_info=state["region_info"],
+                    strategy_selection=state["strategy_selection"],
+                    index_hubs=rule_hubs,
+                )
+                llm_hubs, llm_warnings = generate_candidate_hubs_for_place_mentions(
+                    suggestions[:5],
+                    state["strategy_selection"],
+                )
+            except Exception as exc:
+                llm_warnings.append(f"llm_hub_proposal_failed:{exc}")
+        llm_hubs = llm_hubs[:5]
+        progress.emit(_format_hub_progress("LLM 推荐 hub", llm_hubs, limit=5))
+        if hub_planner is not None and transfer_hubs is None:
+            backfilled = _backfill_supplemental_hubs(
+                llm_hubs,
+                supplemental_hubs,
+                excluded_hub_ids={hub.hub_id for hub in [*explicit_hubs, *rule_hubs]},
+                limit=5,
             )
-            existing = {hub.hub_id for hub in hubs}
-            hubs.extend(hub for hub in explicit_hubs if hub.hub_id not in existing)
-        return {**state, "candidate_hubs": hubs}
+            if len(backfilled) > len(llm_hubs):
+                llm_warnings.append(f"supplemental_hubs_backfilled:{len(backfilled) - len(llm_hubs)}")
+            llm_hubs = backfilled
+        progress.emit(_format_hub_progress("LLM 补充 hub", llm_hubs, limit=5))
+
+        hubs = _merge_hubs_with_budget(
+            explicit_hubs,
+            llm_hubs,
+            rule_hubs,
+            budget=merge_budget,
+        )
+        warnings = list(state.get("warnings", [])) + explicit_warnings + [
+            f"llm_hub:{warning}" for warning in llm_warnings
+        ]
+        progress.emit(_format_hub_progress("进入查询计划的 hub", hubs, limit=10))
+        return {
+            **state,
+            "index_candidate_hubs": rule_hubs,
+            "llm_candidate_hubs": llm_hubs,
+            "candidate_hubs": hubs,
+            "hub_endpoint_decisions": endpoint_decisions,
+            "warnings": warnings,
+        }
+
+    def validate_candidate_hubs(state: TravelPlanState) -> TravelPlanState:
+        progress.emit("校验候选中转是否误判为起终点...")
+        decisions = list(state.get("hub_endpoint_decisions", []))
+        warnings = list(state.get("warnings", []))
+        if hub_endpoint_validator is not None:
+            try:
+                decisions = hub_endpoint_validator.validate(
+                    user_input=state.get("user_input", ""),
+                    intent=state["intent"],
+                    region_info=state["region_info"],
+                    candidate_hubs=state.get("candidate_hubs", []),
+                )
+            except Exception as exc:
+                warnings.append(f"llm_endpoint_validator_failed:{exc}")
+
+        validated_hubs, validation_warnings = _validate_candidate_hubs_against_endpoints(
+            state["intent"],
+            state.get("candidate_hubs", []),
+            decisions,
+        )
+        warnings.extend(validation_warnings)
+        return {
+            **state,
+            "candidate_hubs": validated_hubs,
+            "endpoint_validated_hubs": validated_hubs,
+            "warnings": warnings,
+        }
 
     def build_query_plan(state: TravelPlanState) -> TravelPlanState:
+        progress.emit("构建火车和机票查询计划...")
         query_plan = build_agent_query_plan(
             state["intent"],
             state["strategy_selection"],
@@ -147,6 +351,7 @@ def build_travel_plan_graph(
         return {**state, "query_plan": query_plan, "warnings": warnings}
 
     def execute_query_plan(state: TravelPlanState) -> TravelPlanState:
+        progress.emit("执行查询计划...")
         query_plan = state["query_plan"]
         warnings = list(state.get("warnings", []))
         train_options: list[TrainOption] = []
@@ -156,20 +361,63 @@ def build_travel_plan_graph(
         route_edges: list[RouteEdge] = []
         flight_search_debug: dict[str, object] = _empty_flight_debug()
         transfer_search_debug: dict[str, object] = {"hubs": [], "searched": []}
+        train_query_cache: dict[tuple[object, ...], tuple[list[TrainOption], str | None]] = {}
+        flight_query_cache: dict[tuple[object, ...], dict] = {}
+        prefetched_direct = state.get("prefetched_direct_flight_state")
+        if prefetched_direct is not None:
+            direct_key = _query_cache_key("flight", state["intent"])
+            flight_query_cache[direct_key] = prefetched_direct
+        flight_item_keys: list[tuple[QueryPlanItem, tuple[object, ...]]] = []
+        flight_evidence_llm_batches = 0
+        consumed_train_keys: set[tuple[object, ...]] = set()
+        train_items = [
+            item
+            for item in query_plan.items
+            if item.executable and item.mode == "train" and train_provider is not None
+        ]
+        train_executor = ThreadPoolExecutor(max_workers=1) if train_items else None
+        train_future = (
+            train_executor.submit(
+                _prefetch_train_queries,
+                train_items,
+                state["intent"],
+                train_provider,
+            )
+            if train_executor is not None and train_provider is not None
+            else None
+        )
+        execution_items = [
+            item for item in query_plan.items if item.executable and item.mode == "flight"
+        ] + [
+            item for item in query_plan.items if item.executable and item.mode == "train"
+        ] + [
+            item for item in query_plan.items if not item.executable
+        ]
 
-        for item in query_plan.items:
+        for item in execution_items:
             if not item.executable:
                 warnings.append(f"query_not_implemented:{item.query_id}")
                 continue
+            progress.emit(_progress_message_for_query_item(item))
+            query_intent = _intent_for_query_item(state["intent"], item)
+            cache_key = _query_cache_key(item.mode, query_intent)
             if item.mode == "train":
                 if train_provider is None:
                     continue
-                try:
-                    options = train_provider.query_train_options(_intent_for_query_item(state["intent"], item))
-                except Exception as exc:
-                    warnings.append(f"train_query_failed:{item.query_id}:{exc}")
+                if train_future is not None:
+                    train_query_cache = train_future.result()
+                    train_future = None
+                    if train_executor is not None:
+                        train_executor.shutdown(wait=True)
+                        train_executor = None
+                cached_train = train_query_cache.get(cache_key, ([], None))
+                if cache_key in consumed_train_keys:
+                    progress.emit(_progress_reuse_message(item))
+                consumed_train_keys.add(cache_key)
+                best_options, train_error = cached_train
+                if train_error is not None:
+                    warnings.append(f"train_query_failed:{item.query_id}:{train_error}")
                     continue
-                best_options = sorted(options, key=_train_sort_key)[:3]
                 if item.strategy == "direct_train":
                     train_options.extend(best_options)
                 elif item.strategy == "train_flight":
@@ -177,7 +425,28 @@ def build_travel_plan_graph(
                 route_edges.extend(_train_edges_from_options(best_options, item, state["intent"].currency))
                 continue
 
-            react_state = react_search.invoke({"intent": _intent_for_query_item(state["intent"], item)})
+            react_state = flight_query_cache.get(cache_key)
+            if react_state is None:
+                react_state = react_search.invoke({"intent": query_intent})
+                flight_query_cache[cache_key] = react_state
+            else:
+                progress.emit(_progress_reuse_message(item))
+            flight_item_keys.append((item, cache_key))
+
+        if batch_evidence_judge is not None and flight_query_cache:
+            progress.emit("批量判断机票证据...")
+            flight_query_cache = _batch_judge_flight_searches(
+                flight_query_cache,
+                batch_evidence_judge,
+                evidence_verifier,
+                fallback_react_search,
+            )
+            flight_evidence_llm_batches = int(
+                getattr(batch_evidence_judge, "last_batch_count", 0)
+            )
+
+        for item, cache_key in flight_item_keys:
+            react_state = flight_query_cache[cache_key]
             flight_options = react_state.get("verified_flight_options", [])
             if item.strategy == "direct_flight":
                 verified_flight_options.extend(flight_options)
@@ -198,6 +467,28 @@ def build_travel_plan_graph(
                 _append_transfer_debug(transfer_search_debug, item, react_state, flight_options)
             route_edges.extend(_flight_edges_from_options(flight_options, item))
 
+        if train_future is not None:
+            train_query_cache = train_future.result()
+        if train_executor is not None:
+            train_executor.shutdown(wait=True)
+
+        planned_train_queries = sum(item.executable and item.mode == "train" for item in query_plan.items)
+        planned_flight_queries = sum(item.executable and item.mode == "flight" for item in query_plan.items)
+        execution_stats = {
+            "planned_train_queries": planned_train_queries,
+            "unique_train_queries": len(train_query_cache),
+            "reused_train_queries": planned_train_queries - len(train_query_cache),
+            "planned_flight_queries": planned_flight_queries,
+            "unique_flight_queries": len(flight_query_cache),
+            "reused_flight_queries": planned_flight_queries - len(flight_query_cache),
+            "flight_evidence_llm_batches": flight_evidence_llm_batches,
+        }
+        progress.emit(
+            "查询复用统计: "
+            f"机票 {planned_flight_queries} 条计划/{len(flight_query_cache)} 次实际查询，"
+            f"火车 {planned_train_queries} 条计划/{len(train_query_cache)} 次实际查询"
+        )
+
         return {
             **state,
             "train_options": train_options,
@@ -207,10 +498,12 @@ def build_travel_plan_graph(
             "route_edges": route_edges,
             "flight_search_debug": flight_search_debug,
             "transfer_search_debug": transfer_search_debug,
+            "query_execution_stats": execution_stats,
             "warnings": warnings,
         }
 
     def build_candidate_routes(state: TravelPlanState) -> TravelPlanState:
+        progress.emit("构建候选路线...")
         routes: list[CandidateRoute] = []
         for option in state.get("train_options", []):
             routes.append(
@@ -220,6 +513,8 @@ def build_travel_plan_graph(
                     train_option=option,
                     total_price=option.lowest_price,
                     summary=_summarise_train_option(option),
+                    total_duration_minutes=_parse_duration_minutes(option.duration),
+                    segment_count=1,
                 )
             )
 
@@ -231,6 +526,8 @@ def build_travel_plan_graph(
                     flight_option=option,
                     total_price=option.price,
                     summary=_summarise_flight_option(option),
+                    total_duration_minutes=_flight_duration_minutes(option),
+                    segment_count=_flight_segment_count(option),
                 )
             )
 
@@ -246,6 +543,7 @@ def build_travel_plan_graph(
         return {**state, "candidate_routes": sorted(routes, key=_route_sort_key)}
 
     def rank_routes(state: TravelPlanState) -> TravelPlanState:
+        progress.emit("排序候选路线...")
         routes = state.get("candidate_routes", [])
         if not routes or route_planner is None:
             return state
@@ -255,9 +553,14 @@ def build_travel_plan_graph(
         except Exception as exc:
             warnings.append(f"route_rank_failed:{exc}")
             return {**state, "warnings": warnings}
-        return {**state, "candidate_routes": ranked, "warnings": warnings}
+        return {
+            **state,
+            "candidate_routes": _enforce_dominance_order(ranked),
+            "warnings": warnings,
+        }
 
     def render_response(state: TravelPlanState) -> TravelPlanState:
+        progress.emit("生成最终推荐结果...")
         routes = state.get("candidate_routes", [])
         warnings = state.get("warnings", [])
         if not routes:
@@ -299,7 +602,9 @@ def build_travel_plan_graph(
 
     graph.add_node("classify_region", classify_region)
     graph.add_node("select_strategies", select_strategies)
+    graph.add_node("prefetch_direct_flight", prefetch_direct_flight)
     graph.add_node("generate_candidate_hubs", generate_candidate_hubs)
+    graph.add_node("validate_candidate_hubs", validate_candidate_hubs)
     graph.add_node("build_query_plan", build_query_plan)
     graph.add_node("execute_query_plan", execute_query_plan)
     graph.add_node("build_candidate_routes", build_candidate_routes)
@@ -309,7 +614,9 @@ def build_travel_plan_graph(
     graph.add_edge(START, "classify_region")
     graph.add_edge("classify_region", "select_strategies")
     graph.add_edge("select_strategies", "generate_candidate_hubs")
-    graph.add_edge("generate_candidate_hubs", "build_query_plan")
+    graph.add_edge("select_strategies", "prefetch_direct_flight")
+    graph.add_edge(["generate_candidate_hubs", "prefetch_direct_flight"], "validate_candidate_hubs")
+    graph.add_edge("validate_candidate_hubs", "build_query_plan")
     graph.add_edge("build_query_plan", "execute_query_plan")
     graph.add_edge("execute_query_plan", "build_candidate_routes")
     graph.add_edge("build_candidate_routes", "rank_routes")
@@ -331,13 +638,53 @@ def _summarise_train_option(option: TrainOption) -> str:
     )
 
 
+def _progress_message_for_query_item(item: QueryPlanItem) -> str:
+    mode_text = "火车" if item.mode == "train" else "机票"
+    strategy_text = {
+        "direct_flight": "直达",
+        "direct_train": "直达",
+        "train_flight": "火车+飞机中转",
+        "flight_train": "飞机+火车中转",
+        "train_train": "火车+火车中转",
+        "flight_flight": "飞机+飞机中转",
+    }.get(item.strategy, item.strategy)
+    return f"查询{strategy_text}{mode_text}: {item.origin} -> {item.destination}"
+
+
+def _progress_reuse_message(item: QueryPlanItem) -> str:
+    mode_text = "火车" if item.mode == "train" else "机票"
+    return f"复用已有{mode_text}查询结果: {item.origin} -> {item.destination}"
+
+
+def _format_hub_progress(label: str, hubs: list[CandidateHub], *, limit: int = 25) -> str:
+    if not hubs:
+        return f"{label}: 无"
+    rendered = []
+    for hub in hubs[:limit]:
+        airport_text = "/".join(hub.airport_codes) if hub.airport_codes else "-"
+        train_text = "/".join(hub.train_places) if hub.train_places else "-"
+        strategy_text = "/".join(hub.strategies)
+        tier_text = hub.flight_tier or "-"
+        score_text = "-" if hub.flight_potential_score is None else f"{hub.flight_potential_score:.2f}"
+        rendered.append(
+            f"{hub.city}(机场:{airport_text}; tier:{tier_text}; score:{score_text}; "
+            f"火车:{train_text}; 策略:{strategy_text})"
+        )
+    suffix = ""
+    if len(hubs) > limit:
+        suffix = f"; 另有 {len(hubs) - limit} 个"
+    return f"{label}({len(hubs)}): " + " | ".join(rendered) + suffix
+
+
 def _summarise_flight_option(option: FlightOption) -> str:
     lowest = option.evidence[0] if option.evidence else None
     metadata = lowest.metadata or {} if lowest else {}
     flight_no = metadata.get("flight_no") or "unknown flight"
-    time_text = ""
-    if option.departure_time and option.arrival_time:
-        time_text = f" {option.departure_time.strftime('%H:%M')}-{option.arrival_time.strftime('%H:%M')}"
+    time_text = _format_datetime_range(
+        option.departure_time,
+        option.arrival_time,
+        travel_date=option.travel_date,
+    )
     return (
         f"Flight {flight_no} {option.origin}->{option.destination} "
         f"{option.travel_date.isoformat()}{time_text} {option.price:.2f} {option.currency}"
@@ -419,6 +766,104 @@ def _intent_for_query_item(base_intent: FlightSearchIntent, item: QueryPlanItem)
     )
 
 
+def _query_cache_key(mode: str, intent: FlightSearchIntent) -> tuple[object, ...]:
+    return (
+        mode,
+        intent.origin.strip().casefold(),
+        intent.destination.strip().casefold(),
+        intent.travel_date,
+        (intent.time_preference or "").strip().casefold(),
+        intent.budget_threshold,
+        intent.currency.strip().upper(),
+        intent.max_segments,
+    )
+
+
+def _prefetch_train_queries(
+    items: list[QueryPlanItem],
+    base_intent: FlightSearchIntent,
+    train_provider: TrainProvider,
+) -> dict[tuple[object, ...], tuple[list[TrainOption], str | None]]:
+    cache: dict[tuple[object, ...], tuple[list[TrainOption], str | None]] = {}
+    for item in items:
+        query_intent = _intent_for_query_item(base_intent, item)
+        cache_key = _query_cache_key("train", query_intent)
+        if cache_key in cache:
+            continue
+        try:
+            options = train_provider.query_train_options(query_intent)
+            cache[cache_key] = (sorted(options, key=_train_sort_key)[:3], None)
+        except Exception as exc:
+            cache[cache_key] = ([], str(exc))
+    return cache
+
+
+def _batch_judge_flight_searches(
+    search_cache: dict[tuple[object, ...], dict],
+    evidence_judge,
+    verifier: FlightEvidenceVerifier,
+    fallback_react_search,
+) -> dict[tuple[object, ...], dict]:
+    requests: list[FlightEvidenceJudgeRequest] = []
+    request_keys: dict[str, tuple[object, ...]] = {}
+    for query_index, (cache_key, react_state) in enumerate(search_cache.items()):
+        evidence_by_url: dict[str, list] = {}
+        for evidence in react_state.get("extracted_evidence", []):
+            evidence_by_url.setdefault(evidence.url, []).append(evidence)
+        result_by_url = {
+            result.url: result
+            for result in react_state.get("raw_results", [])
+            if isinstance(result, SearchResult)
+        }
+        for url_index, (url, evidence) in enumerate(evidence_by_url.items()):
+            request_id = f"q{query_index}:u{url_index}"
+            request_keys[request_id] = cache_key
+            requests.append(
+                FlightEvidenceJudgeRequest(
+                    request_id=request_id,
+                    intent=react_state["intent"],
+                    search_result=result_by_url.get(
+                        url,
+                        SearchResult(
+                            title="",
+                            url=url,
+                            snippet="",
+                            source_name=evidence[0].source_name if evidence else "web",
+                        ),
+                    ),
+                    evidence=evidence,
+                )
+            )
+
+    try:
+        judged_by_request = evidence_judge.judge_many(requests)
+    except Exception:
+        return {
+            cache_key: fallback_react_search.invoke({"intent": react_state["intent"]})
+            for cache_key, react_state in search_cache.items()
+        }
+
+    judged_by_query: dict[tuple[object, ...], list] = {}
+    for request_id, evidence in judged_by_request.items():
+        cache_key = request_keys.get(request_id)
+        if cache_key is not None:
+            judged_by_query.setdefault(cache_key, []).extend(evidence)
+
+    updated: dict[tuple[object, ...], dict] = {}
+    for cache_key, react_state in search_cache.items():
+        judged_evidence = judged_by_query.get(cache_key, [])
+        options = verifier.verify(judged_evidence, react_state["intent"])
+        if react_state.get("extracted_evidence") and not options:
+            updated[cache_key] = fallback_react_search.invoke({"intent": react_state["intent"]})
+            continue
+        updated[cache_key] = {
+            **react_state,
+            "judged_evidence": judged_evidence,
+            "verified_flight_options": options,
+        }
+    return updated
+
+
 def _train_edges_from_options(
     options: list[TrainOption],
     item: QueryPlanItem,
@@ -438,6 +883,7 @@ def _train_edges_from_options(
                 currency=currency,
                 departure_time=option.start_time,
                 arrival_time=option.arrive_time,
+                duration_minutes=_parse_duration_minutes(option.duration),
                 source="12306_mcp",
                 confidence=0.95,
                 hub_id=item.hub_id,
@@ -466,6 +912,7 @@ def _flight_edges_from_options(
                 currency=option.currency,
                 departure_time=option.departure_time,
                 arrival_time=option.arrival_time,
+                duration_minutes=_flight_duration_minutes(option),
                 source="flight_page_search",
                 confidence=0.8 if option.reliability == "verified" else 0.6,
                 hub_id=item.hub_id,
@@ -498,9 +945,17 @@ def _build_two_leg_routes_from_edges(edges: list[RouteEdge]) -> list[CandidateRo
                 if second_edge.price is None:
                     continue
                 wait_minutes = _compute_wait_minutes(first_edge.arrival_time, second_edge.departure_time)
-                if wait_minutes is not None and wait_minutes < 60:
+                if (
+                    wait_minutes is not None
+                    and wait_minutes < _minimum_transfer_minutes(strategy)
+                ):
                     continue
                 total_price = first_edge.price + second_edge.price
+                total_duration_minutes = _two_leg_duration_minutes(
+                    first_edge,
+                    second_edge,
+                    wait_minutes,
+                )
                 routes.append(
                     CandidateRoute(
                         route_id=f"{strategy}:{hub_id}:{first_edge.edge_id}:{second_edge.edge_id}",
@@ -519,6 +974,11 @@ def _build_two_leg_routes_from_edges(edges: list[RouteEdge]) -> list[CandidateRo
                         transfer_city=_transfer_city_from_edges(first_edge, second_edge),
                         transfer_airport=_transfer_airport_from_edges(first_edge, second_edge),
                         transfer_wait_minutes=wait_minutes,
+                        total_duration_minutes=total_duration_minutes,
+                        segment_count=(
+                            _edge_segment_count(first_edge)
+                            + _edge_segment_count(second_edge)
+                        ),
                     )
                 )
     return sorted(routes, key=_route_sort_key)[:12]
@@ -562,11 +1022,39 @@ def _edge_summary(edge: RouteEdge) -> str:
 
 
 def _edge_time_text(edge: RouteEdge) -> str:
+    if isinstance(edge.departure_time, datetime) and isinstance(edge.arrival_time, datetime):
+        return _format_datetime_range(
+            edge.departure_time,
+            edge.arrival_time,
+            travel_date=edge.travel_date,
+        )
     start = _format_time_value(edge.departure_time)
     end = _format_time_value(edge.arrival_time)
     if start and end:
         return f" {start}-{end}"
     return ""
+
+
+def _format_datetime_range(
+    departure: datetime | None,
+    arrival: datetime | None,
+    *,
+    travel_date: date,
+) -> str:
+    if departure is None or arrival is None:
+        return ""
+    departure_offset = (departure.date() - travel_date).days
+    arrival_offset = (arrival.date() - travel_date).days
+    departure_text = departure.strftime("%H:%M") + _day_offset_suffix(departure_offset)
+    arrival_text = arrival.strftime("%H:%M") + _day_offset_suffix(arrival_offset)
+    return f" {departure_text}-{arrival_text}"
+
+
+def _day_offset_suffix(day_offset: int) -> str:
+    if day_offset == 0:
+        return ""
+    sign = "+" if day_offset > 0 else ""
+    return f"({sign}{day_offset}d)"
 
 
 def _format_time_value(value: datetime | str | None) -> str:
@@ -627,7 +1115,7 @@ def _build_transfer_routes(
             if train.lowest_price is None:
                 continue
             wait_minutes = _compute_transfer_wait_minutes(train.arrive_time, flight.departure_time)
-            if wait_minutes is not None and wait_minutes < 60:
+            if wait_minutes is not None and wait_minutes < _minimum_transfer_minutes("train_flight"):
                 continue
             total_price = train.lowest_price + flight.price
             routes.append(
@@ -649,6 +1137,12 @@ def _build_transfer_routes(
                     transfer_city=train.to_station,
                     transfer_airport=hub_code,
                     transfer_wait_minutes=wait_minutes,
+                    total_duration_minutes=_sum_known_minutes(
+                        _parse_duration_minutes(train.duration),
+                        wait_minutes,
+                        _flight_duration_minutes(flight),
+                    ),
+                    segment_count=1 + _flight_segment_count(flight),
                 )
             )
     return sorted(routes, key=_route_sort_key)[:12]
@@ -658,6 +1152,116 @@ def _route_sort_key(route: CandidateRoute) -> tuple[int, float]:
     if route.total_price is None:
         return (1, float("inf"))
     return (0, route.total_price)
+
+
+def _minimum_transfer_minutes(strategy: str) -> int:
+    # Query-plan legs are independently booked products, so airport and
+    # intermodal transfers need more protection than a through train journey.
+    if strategy == "train_train":
+        return 60
+    return 120
+
+
+def _parse_duration_minutes(value: str | None) -> int | None:
+    if not value:
+        return None
+    try:
+        hours, minutes = value.split(":", 1)
+        return int(hours) * 60 + int(minutes)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _flight_duration_minutes(option: FlightOption) -> int | None:
+    if option.departure_time is None or option.arrival_time is None:
+        return None
+    return max(
+        0,
+        int((option.arrival_time - option.departure_time).total_seconds() // 60),
+    )
+
+
+def _flight_segment_count(option: FlightOption) -> int:
+    for evidence in option.evidence:
+        metadata = evidence.metadata or {}
+        transfer_count = metadata.get("transfer_count")
+        if isinstance(transfer_count, int) and transfer_count >= 0:
+            return transfer_count + 1
+        segments = metadata.get("segments")
+        if isinstance(segments, list) and segments:
+            return len(segments)
+        flight_no = metadata.get("flight_no")
+        if isinstance(flight_no, str) and flight_no:
+            return len([part for part in flight_no.split("+") if part]) or 1
+    return 1
+
+
+def _edge_segment_count(edge: RouteEdge) -> int:
+    if isinstance(edge.raw_option, FlightOption):
+        return _flight_segment_count(edge.raw_option)
+    return 1
+
+
+def _two_leg_duration_minutes(
+    first_edge: RouteEdge,
+    second_edge: RouteEdge,
+    wait_minutes: int | None,
+) -> int | None:
+    return _sum_known_minutes(
+        first_edge.duration_minutes,
+        wait_minutes,
+        second_edge.duration_minutes,
+    )
+
+
+def _sum_known_minutes(*values: int | None) -> int | None:
+    if any(value is None for value in values):
+        return None
+    return sum(value for value in values if value is not None)
+
+
+def _route_dominates(first: CandidateRoute, second: CandidateRoute) -> bool:
+    if (
+        first.total_price is None
+        or second.total_price is None
+        or first.total_duration_minutes is None
+        or second.total_duration_minutes is None
+        or first.segment_count is None
+        or second.segment_count is None
+    ):
+        return False
+    no_worse = (
+        first.total_price <= second.total_price
+        and first.total_duration_minutes <= second.total_duration_minutes
+        and first.segment_count <= second.segment_count
+    )
+    strictly_better = (
+        first.total_price < second.total_price
+        or first.total_duration_minutes < second.total_duration_minutes
+        or first.segment_count < second.segment_count
+    )
+    return no_worse and strictly_better
+
+
+def _enforce_dominance_order(routes: list[CandidateRoute]) -> list[CandidateRoute]:
+    """Keep LLM preferences unless they violate an objective dominance relation."""
+    remaining = list(routes)
+    ordered: list[CandidateRoute] = []
+    while remaining:
+        next_index = next(
+            (
+                index
+                for index, route in enumerate(remaining)
+                if not any(
+                    _route_dominates(other, route)
+                    for other_index, other in enumerate(remaining)
+                    if other_index != index
+                )
+            ),
+            0,
+        )
+        ordered.append(remaining.pop(next_index))
+    return ordered
 
 
 def _train_sort_key(train: TrainOption) -> tuple[int, float]:
@@ -682,6 +1286,8 @@ def _compute_wait_minutes(
     first_arrival: datetime | str | None,
     second_departure: datetime | str | None,
 ) -> int | None:
+    if isinstance(first_arrival, datetime) and isinstance(second_departure, datetime):
+        return int((second_departure - first_arrival).total_seconds() // 60)
     first_minutes = _minutes_since_midnight(first_arrival)
     second_minutes = _minutes_since_midnight(second_departure)
     if first_minutes is None or second_minutes is None:
@@ -711,6 +1317,229 @@ def _dedupe_hubs(hubs: list[str]) -> list[str]:
     return output
 
 
+def _merge_hubs_with_budget(
+    explicit_hubs: list[CandidateHub],
+    llm_hubs: list[CandidateHub],
+    index_hubs: list[CandidateHub],
+    *,
+    budget: QueryBudget,
+) -> list[CandidateHub]:
+    selected: list[CandidateHub] = []
+    seen: set[tuple[str, tuple[str, ...], tuple[str, ...]]] = set()
+    grouped_count: dict[str, int] = {}
+    for hub in [*explicit_hubs, *llm_hubs, *index_hubs]:
+        key = (hub.hub_id, tuple(hub.airport_codes), tuple(hub.train_places))
+        if key in seen:
+            continue
+        usable_strategies = [
+            strategy for strategy in hub.strategies
+            if grouped_count.get(strategy, 0) < budget.max_hubs_per_strategy
+        ]
+        if not usable_strategies:
+            continue
+        seen.add(key)
+        selected.append(
+            CandidateHub(
+                hub_id=hub.hub_id,
+                city=hub.city,
+                airport_codes=hub.airport_codes,
+                train_places=hub.train_places,
+                strategies=usable_strategies,
+                priority=hub.priority,
+                reason=hub.reason,
+                flight_potential_score=hub.flight_potential_score,
+                flight_tier=hub.flight_tier,
+            )
+        )
+        for strategy in usable_strategies:
+            grouped_count[strategy] = grouped_count.get(strategy, 0) + 1
+    return selected
+
+
+def _backfill_supplemental_hubs(
+    llm_hubs: list[CandidateHub],
+    supplemental_hubs: list[CandidateHub],
+    *,
+    excluded_hub_ids: set[str],
+    limit: int,
+) -> list[CandidateHub]:
+    selected: list[CandidateHub] = []
+    seen = set(excluded_hub_ids)
+    for hub in [*llm_hubs, *supplemental_hubs]:
+        if hub.hub_id in seen:
+            continue
+        seen.add(hub.hub_id)
+        selected.append(hub)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def _validate_candidate_hubs_against_endpoints(
+    intent: FlightSearchIntent,
+    hubs: list[CandidateHub],
+    decisions: list["HubEndpointDecision"],
+) -> tuple[list[CandidateHub], list[str]]:
+    origin_identity = _endpoint_identity(intent.origin, label="origin")
+    destination_identity = _endpoint_identity(intent.destination, label="destination")
+    by_hub_id = {decision.hub_id: decision for decision in decisions}
+    validated: list[CandidateHub] = []
+    warnings: list[str] = []
+
+    for hub in hubs:
+        decision = by_hub_id.get(hub.hub_id)
+        corrected_hub = _apply_hub_endpoint_correction(hub, decision)
+        origin_match = _hub_matches_endpoint(corrected_hub, origin_identity)
+        destination_match = _hub_matches_endpoint(corrected_hub, destination_identity)
+        if origin_match or destination_match:
+            warnings.append(f"hub_is_origin_or_destination:{corrected_hub.city or corrected_hub.hub_id}")
+            continue
+        validated.append(corrected_hub)
+
+    return validated, warnings
+
+
+def _apply_hub_endpoint_correction(
+    hub: CandidateHub,
+    decision: "HubEndpointDecision | None",
+) -> CandidateHub:
+    if decision is None:
+        return hub
+
+    airport_codes = _validated_airport_codes(decision.corrected_airport_codes) or hub.airport_codes
+    train_places = _validated_train_places(decision.corrected_train_places) or hub.train_places
+    flight_potential_score, flight_tier = _flight_potential_for_airport_codes(airport_codes)
+    city = (decision.corrected_city or "").strip() or hub.city
+    if city == hub.city and airport_codes == hub.airport_codes and train_places == hub.train_places:
+        return hub
+    return CandidateHub(
+        hub_id=hub.hub_id,
+        city=city,
+        airport_codes=airport_codes,
+        train_places=train_places,
+        strategies=hub.strategies,
+        priority=hub.priority,
+        reason=hub.reason,
+        flight_potential_score=flight_potential_score or hub.flight_potential_score,
+        flight_tier=flight_tier or hub.flight_tier,
+    )
+
+
+def _validated_airport_codes(values: list[str]) -> list[str]:
+    airport_index = get_airport_index()
+    result: list[str] = []
+    for value in values:
+        airport = airport_index.resolve(value)
+        if airport is None:
+            continue
+        if airport.iata not in result:
+            result.append(airport.iata)
+    return result
+
+
+def _validated_train_places(values: list[str]) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        place = normalise_train_query_place(value)
+        if place is None:
+            continue
+        if place not in result:
+            result.append(place)
+    return result
+
+
+def _flight_potential_for_airport_codes(codes: list[str]) -> tuple[float | None, str | None]:
+    airport_index = get_airport_index()
+    score: float | None = None
+    tier: str | None = None
+    tier_rank = {"T1": 4, "T2": 3, "T3": 2, "T4": 1}
+    for code in codes:
+        airport = airport_index.resolve(code)
+        if airport is None:
+            continue
+        if airport.flight_potential_score is not None:
+            score = airport.flight_potential_score if score is None else max(score, airport.flight_potential_score)
+        if airport.flight_tier and tier_rank.get(airport.flight_tier, 0) > tier_rank.get(tier or "", 0):
+            tier = airport.flight_tier
+    return score, tier
+
+
+def _endpoint_identity(value: str, *, label: str) -> EndpointIdentity:
+    airport_index = get_airport_index()
+    station_index = get_station_index()
+    cities: set[str] = set()
+    airport_codes: set[str] = set()
+    train_places: set[str] = set()
+
+    airport = airport_index.resolve(value)
+    if airport is not None:
+        airport_codes.add(airport.iata)
+        if airport.city:
+            cities.add(airport.city)
+        station_city = station_city_for_airport(airport)
+        if station_city:
+            cities.add(station_city)
+            primary_station = station_index.primary_station_for_city(station_city)
+            train_places.add(primary_station or station_city)
+
+    train_place = normalise_train_query_place(value)
+    if train_place is not None:
+        train_places.add(train_place)
+        station = station_index.by_name.get(train_place)
+        if station is not None and station.city_name:
+            cities.add(station.city_name)
+            primary_station = station_index.primary_station_for_city(station.city_name)
+            train_places.add(primary_station or station.city_name)
+        elif train_place in station_index.city_names:
+            cities.add(train_place)
+            primary_station = station_index.primary_station_for_city(train_place)
+            train_places.add(primary_station or train_place)
+
+    for airport_record in airport_index.airports:
+        airport_city = station_city_for_airport(airport_record)
+        if airport_city and airport_city in cities:
+            airport_codes.add(airport_record.iata)
+        elif airport_record.city and airport_record.city in cities:
+            airport_codes.add(airport_record.iata)
+
+    for city in list(cities):
+        primary_station = station_index.primary_station_for_city(city)
+        if primary_station:
+            train_places.add(primary_station)
+
+    return EndpointIdentity(
+        label=label,
+        cities=frozenset(cities),
+        airport_codes=frozenset(airport_codes),
+        train_places=frozenset(train_places),
+    )
+
+
+def _hub_matches_endpoint(hub: CandidateHub, endpoint: EndpointIdentity) -> bool:
+    if hub.city in endpoint.cities:
+        return True
+    if set(hub.airport_codes) & set(endpoint.airport_codes):
+        return True
+    if set(hub.train_places) & set(endpoint.train_places):
+        return True
+    for airport_code in hub.airport_codes:
+        airport = get_airport_index().resolve(airport_code)
+        if airport is None:
+            continue
+        airport_city = station_city_for_airport(airport)
+        if airport_city and airport_city in endpoint.cities:
+            return True
+        if airport.city and airport.city in endpoint.cities:
+            return True
+    for train_place in hub.train_places:
+        station = get_station_index().by_name.get(train_place)
+        if station is not None and station.city_name in endpoint.cities:
+            return True
+        if train_place in endpoint.cities:
+            return True
+    return False
+
+
 def _default_transfer_hubs(*, destination_code: str) -> list[str]:
     international_hubs = ["SHA", "HGH", "CAN", "SZX", "CTU", "TFU", "PEK", "PKX", "KMG", "CKG"]
     domestic_hubs = ["SHA", "CAN", "CTU", "PEK", "KMG"]
@@ -728,6 +1557,157 @@ class RouteChoice(BaseModel):
 class RouteDecision(BaseModel):
     ranked: list[RouteChoice] = Field(default_factory=list)
     summary: str = ""
+
+
+class HubEndpointDecision(BaseModel):
+    hub_id: str
+    is_origin_endpoint: bool = False
+    is_destination_endpoint: bool = False
+    corrected_city: str | None = None
+    corrected_airport_codes: list[str] = Field(default_factory=list)
+    corrected_train_places: list[str] = Field(default_factory=list)
+    reason: str | None = None
+
+
+class HubEndpointDecisionBatch(BaseModel):
+    decisions: list[HubEndpointDecision] = Field(default_factory=list)
+
+
+class HubSuggestion(BaseModel):
+    raw_text: str | None = None
+    official_airport_name: str | None = None
+    city: str | None = None
+    country: str | None = None
+    iata_if_explicit: str | None = None
+    station_name: str | None = Field(
+        default=None,
+        description="12306 Chinese station name for railway hubs.",
+    )
+    station_pinyin: str | None = None
+    strategies: list[str] = Field(default_factory=list)
+    reason: str | None = None
+
+
+class HubSuggestionBatch(BaseModel):
+    suggestions: list[HubSuggestion] = Field(default_factory=list)
+
+
+class HubPlanningBatch(BaseModel):
+    suggestions: list[HubSuggestion] = Field(default_factory=list)
+    decisions: list[HubEndpointDecision] = Field(default_factory=list)
+
+
+class LlmHubPlanner:
+    def __init__(self, llm, *, max_suggestions: int = 5) -> None:
+        self.llm = llm
+        self.max_suggestions = max_suggestions
+
+    def plan(
+        self,
+        *,
+        user_input: str,
+        intent: FlightSearchIntent,
+        region_info: RegionInfo,
+        strategy_selection: StrategySelection,
+        index_hubs: list[CandidateHub],
+        supplemental_hubs: list[CandidateHub],
+        explicit_hubs: list[CandidateHub],
+    ) -> HubPlanningBatch:
+        structured = self.llm.with_structured_output(HubPlanningBatch)
+        response = structured.invoke(
+            [
+                (
+                    "system",
+                    _hub_planning_prompt(intent, region_info, strategy_selection, self.max_suggestions),
+                ),
+                (
+                    "human",
+                    json.dumps(
+                        {
+                            "user_input": user_input,
+                            "index_hubs": _hub_payload(index_hubs),
+                            "supplemental_candidates": _hub_payload(supplemental_hubs),
+                            "explicit_hubs": _hub_payload(explicit_hubs),
+                            "candidate_hubs": _hub_payload([*explicit_hubs, *index_hubs]),
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
+            ]
+        )
+        batch = response if isinstance(response, HubPlanningBatch) else HubPlanningBatch.model_validate(response)
+        return HubPlanningBatch(
+            suggestions=batch.suggestions[: self.max_suggestions],
+            decisions=batch.decisions,
+        )
+
+
+class LlmHubProposer:
+    def __init__(self, llm, *, max_suggestions: int = 5) -> None:
+        self.llm = llm
+        self.max_suggestions = max_suggestions
+
+    def propose(
+        self,
+        *,
+        user_input: str,
+        intent: FlightSearchIntent,
+        region_info: RegionInfo,
+        strategy_selection: StrategySelection,
+        index_hubs: list[CandidateHub],
+    ) -> list[HubSuggestion]:
+        structured = self.llm.with_structured_output(HubSuggestionBatch)
+        response = structured.invoke(
+            [
+                ("system", _hub_suggestion_prompt(intent, region_info, strategy_selection, self.max_suggestions)),
+                (
+                    "human",
+                    json.dumps(
+                        {
+                            "user_input": user_input,
+                            "index_hubs": _hub_payload(index_hubs),
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
+            ]
+        )
+        batch = response if isinstance(response, HubSuggestionBatch) else HubSuggestionBatch.model_validate(response)
+        return batch.suggestions[: self.max_suggestions]
+
+
+class LlmHubEndpointValidator:
+    def __init__(self, llm) -> None:
+        self.llm = llm
+
+    def validate(
+        self,
+        *,
+        user_input: str,
+        intent: FlightSearchIntent,
+        region_info: RegionInfo,
+        candidate_hubs: list[CandidateHub],
+    ) -> list[HubEndpointDecision]:
+        structured = self.llm.with_structured_output(HubEndpointDecisionBatch)
+        response = structured.invoke(
+            [
+                ("system", _hub_endpoint_validation_prompt(intent, region_info)),
+                (
+                    "human",
+                    json.dumps(
+                        {
+                            "user_input": user_input,
+                            "origin": intent.origin,
+                            "destination": intent.destination,
+                            "candidate_hubs": _hub_payload(candidate_hubs),
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
+            ]
+        )
+        batch = response if isinstance(response, HubEndpointDecisionBatch) else HubEndpointDecisionBatch.model_validate(response)
+        return batch.decisions
 
 
 class LlmRoutePlanner:
@@ -761,7 +1741,9 @@ class LlmRoutePlanner:
                 )
             )
         remaining = [route for route in routes if route.route_id not in {r.route_id for r in ordered}]
-        return ordered + sorted(remaining, key=_route_sort_key)
+        return _enforce_dominance_order(
+            ordered + sorted(remaining, key=_route_sort_key)
+        )
 
 
 def _route_payload(routes: list[CandidateRoute]) -> dict[str, object]:
@@ -774,9 +1756,116 @@ def _route_payload(routes: list[CandidateRoute]) -> dict[str, object]:
                 "total_price": route.total_price,
                 "summary": route.summary,
                 "transfer_wait_minutes": route.transfer_wait_minutes,
+                "total_duration_minutes": route.total_duration_minutes,
+                "segment_count": route.segment_count,
             }
         )
     return {"routes": serialized}
+
+
+def _hub_payload(hubs: list[CandidateHub]) -> list[dict[str, object]]:
+    return [
+        {
+            "hub_id": hub.hub_id,
+            "city": hub.city,
+            "airport_codes": hub.airport_codes,
+            "train_places": hub.train_places,
+            "strategies": hub.strategies,
+            "priority": hub.priority,
+            "reason": hub.reason,
+        }
+        for hub in hubs
+    ]
+
+
+def _hub_planning_prompt(
+    intent: FlightSearchIntent,
+    region_info: RegionInfo,
+    strategy_selection: StrategySelection,
+    max_suggestions: int,
+) -> str:
+    return f"""
+You plan and validate transfer hubs for a multimodal travel search agent in one pass.
+
+Trip:
+- origin: {intent.origin}
+- destination: {intent.destination}
+- travel_date: {intent.travel_date.isoformat()}
+- route_type: {region_info.route_type}
+- enabled_strategies: {", ".join(strategy_selection.enabled)}
+
+Tasks:
+1. Return at most {max_suggestions} additional hub suggestions beyond index_hubs and explicit_hubs.
+2. Return one endpoint decision for every item in candidate_hubs when possible.
+
+Rules for suggestions:
+- Return exactly {max_suggestions} suggestions when supplemental_candidates contains at least that many valid hubs.
+- Prefer selecting diverse, practical hubs from supplemental_candidates by copying one airport code into raw_text.
+- You may propose another high-value hub only when it is clearly better than the supplied candidates.
+- Prefer hubs that may improve price or practical routing.
+- Never suggest the origin or destination city as a transfer hub.
+- For airports, provide official_airport_name, city, and country when possible.
+- For rail hubs, provide station_name as the 12306 Chinese station name.
+- Do not invent prices, schedules, or availability.
+
+Rules for endpoint decisions:
+- Same-city airports and railway stations count as the same endpoint.
+- Mark whether each candidate is the origin or destination endpoint.
+- Correct inconsistent city, airport code, or station fields when needed.
+- Decisions and suggestions will be verified against local airport and station indexes.
+""".strip()
+
+
+def _hub_suggestion_prompt(
+    intent: FlightSearchIntent,
+    region_info: RegionInfo,
+    strategy_selection: StrategySelection,
+    max_suggestions: int,
+) -> str:
+    return f"""
+You propose additional transfer hubs for a multimodal travel search agent.
+
+Trip:
+- origin: {intent.origin}
+- destination: {intent.destination}
+- travel_date: {intent.travel_date.isoformat()}
+- route_type: {region_info.route_type}
+- enabled_strategies: {", ".join(strategy_selection.enabled)}
+
+Rules:
+- Return at most {max_suggestions} suggestions.
+- Prefer hubs that may improve price or practical routing beyond the provided index_hubs.
+- For airports, provide official_airport_name, city, and country when possible.
+- For rail hubs, provide station_name as the 12306 Chinese station name.
+- Do not invent prices or final routes.
+- Suggestions will be validated against local airport and station indexes; unverifiable hubs will be discarded.
+""".strip()
+
+
+def _hub_endpoint_validation_prompt(
+    intent: FlightSearchIntent,
+    region_info: RegionInfo,
+) -> str:
+    return f"""
+You validate transfer hubs for a multimodal travel search agent.
+
+Trip:
+- origin: {intent.origin}
+- destination: {intent.destination}
+- travel_date: {intent.travel_date.isoformat()}
+- route_type: {region_info.route_type}
+
+Task:
+- For each candidate hub, decide whether it is actually the origin endpoint or destination endpoint.
+- Same-city airports count as the same endpoint. For example CTU, TFU, HZU, and Chengdu/成都 are all Chengdu-side endpoints.
+- City airport groups count as the same endpoint. For example BJS, PEK, PKX, and Beijing/北京 are all Beijing-side endpoints.
+- Same-city railway stations count as the same endpoint.
+- If a hub has incorrect or incomplete city/airport/station fields, provide corrected_city, corrected_airport_codes, and corrected_train_places.
+- Do not invent final routes, prices, or availability.
+- The system will verify your decision against local airport and 12306 station indexes before using it.
+
+Return one decision per candidate hub_id when possible.
+""".strip()
 
 
 def _route_planning_prompt(intent: FlightSearchIntent) -> str:
@@ -792,9 +1881,13 @@ Trip intent:
 
 Scoring priorities:
 1) Lower total price is better.
-2) Route feasibility matters: avoid tight transfers.
-3) Fewer transfers is better unless savings are significant.
-4) Respect budget threshold when provided.
+2) Compare door-to-door total_duration_minutes, including transfer waits.
+3) Route feasibility matters: independently booked transfers need sufficient time.
+4) Fewer physical segments is better unless savings are significant.
+5) Respect budget threshold and time preference when provided.
+
+Never rank a route below another route that is simultaneously no more expensive,
+no slower, and no more complex (segment_count), with at least one strict advantage.
 
 Return `ranked` with best routes first.
 Every chosen route_id must exist in provided data.

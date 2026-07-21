@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date
 
-from flight_watch_agent.llm import TravelPlanIntent
+from flight_watch_agent.llm import PlaceMention, TravelPlanIntent
 from flight_watch_agent.request_graph import build_travel_plan_request_graph
 
 
@@ -144,3 +144,88 @@ def test_request_graph_infers_route_from_user_input_when_llm_misses_places():
     assert state["flight_search_intent"].destination == "TFU"
     assert state["flight_search_intent"].time_preference == "morning"
     assert state["response"] == "planned SIN->TFU on 2026-07-09"
+
+
+def test_request_graph_passes_structured_hub_places_to_plan_graph():
+    plan_graph = FakeTravelPlanGraph()
+    graph = build_travel_plan_request_graph(
+        llm=FakeLlm(
+            TravelPlanIntent(
+                action="plan_trip",
+                origin="CTU",
+                destination="DLU",
+                travel_date=date(2026, 7, 10),
+                hub_places=[
+                    PlaceMention(
+                        kind="station",
+                        raw_text="guangtongbei",
+                        station_pinyin="guangtongbei",
+                    )
+                ],
+            )
+        ),
+        travel_plan_graph=plan_graph,
+    )
+
+    state = graph.invoke({"user_input": "Chengdu to Dali via Guangtongbei"})
+
+    assert state["flight_search_intent"].origin == "CTU"
+    assert plan_graph.invocations[0]["explicit_hub_places"][0].station_pinyin == "guangtongbei"
+
+
+def test_request_graph_uses_user_city_instead_of_model_selected_minor_airport():
+    plan_graph = FakeTravelPlanGraph()
+    graph = build_travel_plan_request_graph(
+        llm=FakeLlm(
+            TravelPlanIntent(
+                action="plan_trip",
+                origin="HZU",
+                destination="SIN",
+                origin_place=PlaceMention(
+                    raw_text="成都",
+                    kind="city",
+                    city="Chengdu",
+                    country="CN",
+                ),
+                destination_place=PlaceMention(
+                    raw_text="新加坡",
+                    kind="city",
+                    city="Singapore",
+                    country="SG",
+                ),
+                travel_date=date(2026, 11, 15),
+            )
+        ),
+        travel_plan_graph=plan_graph,
+    )
+
+    state = graph.invoke({"user_input": "帮我查一下 2026-11-15 成都到新加坡的方案"})
+
+    assert state["flight_search_intent"].origin == "CTU"
+    assert state["flight_search_intent"].destination == "SIN"
+
+
+def test_request_graph_preserves_explicit_minor_airport_code():
+    plan_graph = FakeTravelPlanGraph()
+    graph = build_travel_plan_request_graph(
+        llm=FakeLlm(
+            TravelPlanIntent(
+                action="plan_trip",
+                origin="HZU",
+                destination="SIN",
+                origin_place=PlaceMention(
+                    raw_text="HZU",
+                    kind="airport",
+                    city="Chengdu",
+                    country="CN",
+                    iata_if_explicit="HZU",
+                ),
+                travel_date=date(2026, 11, 15),
+            )
+        ),
+        travel_plan_graph=plan_graph,
+    )
+
+    state = graph.invoke({"user_input": "2026-11-15 HZU 到 SIN"})
+
+    assert state["flight_search_intent"].origin == "HZU"

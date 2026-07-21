@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
+
+import flight_watch_agent.ctrip as ctrip_module
 
 from flight_watch_agent.ctrip import (
     REQUIRED_CTRIP_COOKIES,
     CtripRouteSearchTool,
+    CtripSeleniumWirePageExtractor,
     _CtripLoginSession,
     _configure_browser_options,
     _evidence_satisfies_requested_time,
@@ -14,7 +17,7 @@ from flight_watch_agent.ctrip import (
     parse_ctrip_selenium_url,
 )
 from flight_watch_agent.app import build_default_flight_page_extractor, build_default_flight_web_search_tool
-from flight_watch_agent.models import FlightSearchIntent
+from flight_watch_agent.models import FlightEvidence, FlightSearchIntent
 
 
 def test_ctrip_route_search_tool_builds_selenium_task_url():
@@ -404,6 +407,144 @@ def test_default_flight_page_extractor_uses_only_ctrip_extractor():
     extractor = build_default_flight_page_extractor()
 
     assert [type(item).__name__ for item in extractor.extractors] == ["CtripSeleniumWirePageExtractor"]
+
+
+def test_ctrip_extractor_reuses_browser_between_route_queries(monkeypatch):
+    drivers = []
+
+    class ReusableFakeDriver:
+        def __init__(self) -> None:
+            self._requests = []
+            self.urls = []
+            self.quit_calls = 0
+
+        @property
+        def requests(self):
+            return self._requests
+
+        @requests.deleter
+        def requests(self):
+            self._requests = []
+
+        def get(self, url: str) -> None:
+            self.urls.append(url)
+
+        def quit(self) -> None:
+            self.quit_calls += 1
+
+    def build_driver(**_kwargs):
+        driver = ReusableFakeDriver()
+        drivers.append(driver)
+        return driver
+
+    def parse_payload(_payload, intent, **_kwargs):
+        departure = datetime.combine(intent.travel_date, datetime.min.time(), tzinfo=timezone.utc)
+        return [
+            FlightEvidence(
+                source_name="flights.ctrip.com",
+                url="https://flights.ctrip.com/test",
+                price=500.0,
+                currency="CNY",
+                departure_time=departure,
+                arrival_time=departure,
+                captured_at=departure,
+                origin=intent.origin,
+                destination=intent.destination,
+                travel_date=intent.travel_date,
+            )
+        ]
+
+    monkeypatch.setattr(ctrip_module, "_init_seleniumwire_driver", build_driver)
+    monkeypatch.setattr(ctrip_module, "_wait_for_ctrip_search_payload", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(ctrip_module, "parse_ctrip_batch_search_payload", parse_payload)
+    extractor = CtripSeleniumWirePageExtractor(reuse_browser_session=True)
+
+    extractor.extract(
+        build_ctrip_selenium_url(
+            FlightSearchIntent(origin="CTU", destination="SIN", travel_date=date(2026, 8, 1))
+        )
+    )
+    extractor.extract(
+        build_ctrip_selenium_url(
+            FlightSearchIntent(origin="CAN", destination="SIN", travel_date=date(2026, 8, 1))
+        )
+    )
+
+    assert len(drivers) == 1
+    assert len(drivers[0].urls) == 2
+    assert drivers[0].quit_calls == 0
+    extractor.close()
+    assert drivers[0].quit_calls == 1
+
+
+def test_ctrip_extractor_prioritises_search_url_that_succeeded_in_session(monkeypatch):
+    class AdaptiveFakeDriver:
+        def __init__(self) -> None:
+            self._requests = []
+            self.urls = []
+
+        @property
+        def requests(self):
+            return self._requests
+
+        @requests.deleter
+        def requests(self):
+            self._requests = []
+
+        def get(self, url: str) -> None:
+            self.urls.append(url)
+
+        def quit(self) -> None:
+            return None
+
+    driver = AdaptiveFakeDriver()
+    monkeypatch.setattr(ctrip_module, "_init_seleniumwire_driver", lambda **_kwargs: driver)
+    monkeypatch.setattr(
+        ctrip_module,
+        "_wait_for_ctrip_search_payload",
+        lambda current_driver, **_kwargs: {
+            "legacy": "/online/list/" in current_driver.urls[-1]
+        },
+    )
+
+    def parse_payload(payload, intent, **_kwargs):
+        if not payload["legacy"]:
+            return []
+        timestamp = datetime.combine(intent.travel_date, datetime.min.time(), tzinfo=timezone.utc)
+        return [
+            FlightEvidence(
+                source_name="flights.ctrip.com",
+                url=driver.urls[-1],
+                price=500.0,
+                currency="CNY",
+                departure_time=timestamp,
+                arrival_time=timestamp,
+                captured_at=timestamp,
+                origin=intent.origin,
+                destination=intent.destination,
+                travel_date=intent.travel_date,
+            )
+        ]
+
+    monkeypatch.setattr(ctrip_module, "parse_ctrip_batch_search_payload", parse_payload)
+    extractor = CtripSeleniumWirePageExtractor(reuse_browser_session=True)
+
+    extractor.extract(
+        build_ctrip_selenium_url(
+            FlightSearchIntent(origin="CTU", destination="SIN", travel_date=date(2026, 8, 1))
+        )
+    )
+    first_query_url_count = len(driver.urls)
+    extractor.extract(
+        build_ctrip_selenium_url(
+            FlightSearchIntent(origin="CAN", destination="SIN", travel_date=date(2026, 8, 1))
+        )
+    )
+
+    assert first_query_url_count == 2
+    assert len(driver.urls) == 3
+    assert "/online/list/" in driver.urls[-1]
+    extractor.close()
 
 
 def test_configure_browser_options_uses_incognito_without_local_profile():

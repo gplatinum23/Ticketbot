@@ -3,9 +3,14 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 
 from flight_watch_agent.flight_react import (
+    FlightEvidenceBatchDecision,
+    FlightEvidenceBatchDecisionResult,
     FlightEvidenceDecision,
     FlightEvidenceDecisionBatch,
+    FlightEvidenceJudgeRequest,
     FlightEvidenceVerifier,
+    FlightResponseDecision,
+    FlightResponseDecisionBatch,
     LlmFlightEvidenceJudge,
     SkyscannerRouteSearchTool,
     build_react_flight_search_graph,
@@ -68,6 +73,117 @@ class FakeLlm:
     def with_structured_output(self, schema):
         self.schema = schema
         return self.structured_llm
+
+
+def test_llm_evidence_judge_batches_multiple_route_requests():
+    llm = FakeLlm(
+        FlightEvidenceBatchDecisionResult(
+            decisions=[
+                FlightEvidenceBatchDecision(
+                    request_id="route-a",
+                    candidate_index=0,
+                    accept=True,
+                    confidence=0.95,
+                    price=800,
+                    currency="CNY",
+                    origin="BJS",
+                    destination="SHA",
+                    travel_date=date(2026, 7, 9),
+                ),
+                FlightEvidenceBatchDecision(
+                    request_id="route-b",
+                    candidate_index=0,
+                    accept=True,
+                    confidence=0.90,
+                    price=900,
+                    currency="CNY",
+                    origin="BJS",
+                    destination="CAN",
+                    travel_date=date(2026, 7, 9),
+                ),
+            ]
+        )
+    )
+    judge = LlmFlightEvidenceJudge(llm, max_batch_evidence=10)
+    intent_a = _intent()
+    intent_b = FlightSearchIntent(
+        origin="BJS",
+        destination="CAN",
+        travel_date=date(2026, 7, 9),
+        currency="CNY",
+    )
+    result_a = _result("ctrip", "https://example.com/a")
+    result_b = _result("ctrip", "https://example.com/b")
+
+    judged = judge.judge_many(
+        [
+            FlightEvidenceJudgeRequest(
+                request_id="route-a",
+                intent=intent_a,
+                search_result=result_a,
+                evidence=[_evidence("ctrip", result_a.url, 810)],
+            ),
+            FlightEvidenceJudgeRequest(
+                request_id="route-b",
+                intent=intent_b,
+                search_result=result_b,
+                evidence=[
+                    FlightEvidence(
+                        **{
+                            **_evidence("ctrip", result_b.url, 910).__dict__,
+                            "destination": "CAN",
+                        }
+                    )
+                ],
+            ),
+        ]
+    )
+
+    assert len(llm.structured_llm.messages) == 1
+    assert judge.last_batch_count == 1
+    assert judged["route-a"][0].price == 800
+    assert judged["route-b"][0].price == 900
+
+
+def test_llm_evidence_judge_uses_one_response_decision_for_structured_ctrip_itineraries():
+    llm = FakeLlm(
+        FlightResponseDecisionBatch(
+            decisions=[
+                FlightResponseDecision(
+                    request_id="ctrip-route",
+                    accept=True,
+                    confidence=0.95,
+                )
+            ]
+        )
+    )
+    judge = LlmFlightEvidenceJudge(llm)
+    intent = _intent()
+    result = _result("flights.ctrip.com", "https://flights.ctrip.com/a")
+    evidence = [
+        FlightEvidence(
+            **{
+                **_evidence("flights.ctrip.com", result.url, price).__dict__,
+                "metadata": {"segments": [{"flight_number": f"TEST{index}"}]},
+            }
+        )
+        for index, price in enumerate((810, 820, 830), start=1)
+    ]
+
+    judged = judge.judge_many(
+        [
+            FlightEvidenceJudgeRequest(
+                request_id="ctrip-route",
+                intent=intent,
+                search_result=result,
+                evidence=evidence,
+            )
+        ]
+    )
+
+    assert len(llm.structured_llm.messages) == 1
+    assert judge.last_batch_count == 1
+    assert [item.price for item in judged["ctrip-route"]] == [810, 820, 830]
 
 
 class FakeTrainProvider:
