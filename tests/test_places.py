@@ -36,6 +36,7 @@ def test_airport_index_normalises_names_to_iata():
     assert normalise_airport_code("南京") == "NKG"
     assert normalise_airport_code("南京南") == "NKG"
     assert normalise_airport_code("新加坡") == "SIN"
+    assert normalise_airport_code("济州岛") == "CJU"
     assert normalise_airport_code("成都天府") == "TFU"
     assert normalise_airport_code("nkg") == "NKG"
 

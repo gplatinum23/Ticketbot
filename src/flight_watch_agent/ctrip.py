@@ -516,18 +516,29 @@ def parse_ctrip_batch_search_payload(
             continue
         first_segment = itinerary_segments[0]
         last_segment = itinerary_segments[-1]
+        if not _ctrip_airport_matches_request(
+            first_segment.get("departure_airport_code"),
+            intent.origin,
+        ):
+            continue
+        if not _ctrip_airport_matches_request(
+            last_segment.get("arrival_airport_code"),
+            intent.destination,
+        ):
+            continue
+        departure_time = _parse_ctrip_datetime(first_segment.get("departure_time"))
         evidence.append(
             FlightEvidence(
                 source_name="flights.ctrip.com",
                 url=source_url,
                 price=price,
                 currency=intent.currency or "CNY",
-                departure_time=_parse_ctrip_datetime(first_segment.get("departure_time")),
+                departure_time=departure_time,
                 arrival_time=_parse_ctrip_datetime(last_segment.get("arrival_time")),
                 captured_at=captured_at,
                 origin=intent.origin,
                 destination=intent.destination,
-                travel_date=intent.travel_date,
+                travel_date=departure_time.date() if departure_time else intent.travel_date,
                 metadata=_flight_metadata(
                     itinerary_segments=itinerary_segments,
                     transfer_count=transfer_count,
@@ -539,6 +550,8 @@ def parse_ctrip_batch_search_payload(
 
 
 def _intent_from_query(query: str) -> FlightSearchIntent | None:
+    from .places import normalise_airport_code
+
     pieces = [piece for piece in query.split() if piece]
     if len(pieces) < 3:
         return None
@@ -555,8 +568,8 @@ def _intent_from_query(query: str) -> FlightSearchIntent | None:
     if date_index < 2:
         return None
     return FlightSearchIntent(
-        origin=pieces[0],
-        destination=pieces[1],
+        origin=normalise_airport_code(pieces[0]) or pieces[0],
+        destination=normalise_airport_code(pieces[1]) or pieces[1],
         travel_date=travel_date,
         time_preference=_time_preference_from_query_pieces(pieces),
     )
@@ -830,33 +843,125 @@ def _drive_ctrip_homepage_search(driver, intent: FlightSearchIntent, *, timeout_
     wait = WebDriverWait(driver, timeout_seconds)
     driver.get("https://flights.ctrip.com/online/channel/domestic")
     wait.until(EC.presence_of_element_located((By.CLASS_NAME, "pc_home-jipiao")))
-    driver.find_element(By.CLASS_NAME, "pc_home-jipiao").click()
+    flight_tab = driver.find_element(By.CLASS_NAME, "pc_home-jipiao")
+    _click_ctrip_element(driver, flight_tab)
     wait.until(EC.presence_of_all_elements_located((By.CLASS_NAME, "radio-label")))
-    driver.find_elements(By.CLASS_NAME, "radio-label")[0].click()
+    one_way = driver.find_elements(By.CLASS_NAME, "radio-label")[0]
+    _click_ctrip_element(driver, one_way)
 
     wait.until(EC.presence_of_all_elements_located((By.CLASS_NAME, "form-input-v3")))
     inputs = driver.find_elements(By.CLASS_NAME, "form-input-v3")
-    _replace_input_value(inputs[0], _ctrip_display_name(intent.origin))
-    _replace_input_value(inputs[1], _ctrip_display_name(intent.destination))
+    _select_ctrip_place(
+        driver,
+        inputs[0],
+        intent.origin,
+        timeout_seconds=timeout_seconds,
+    )
+    _select_ctrip_place(
+        driver,
+        inputs[1],
+        intent.destination,
+        timeout_seconds=timeout_seconds,
+    )
 
     date_inputs = driver.find_elements(By.CSS_SELECTOR, "[aria-label=请选择日期]")
     if date_inputs:
-        driver.execute_script(
-            """
-            const input = arguments[0];
-            input.value = arguments[1];
-            input.dispatchEvent(new Event('input', { bubbles: true }));
-            input.dispatchEvent(new Event('change', { bubbles: true }));
-            """,
+        _select_ctrip_travel_date(
+            driver,
             date_inputs[0],
-            intent.travel_date.isoformat(),
+            intent.travel_date,
+            timeout_seconds=timeout_seconds,
         )
 
     buttons = driver.find_elements(By.CLASS_NAME, "search-btn")
     if buttons:
-        buttons[0].click()
+        _click_ctrip_element(driver, buttons[0])
     else:
         inputs[1].send_keys(Keys.ENTER)
+
+
+def _select_ctrip_place(driver, input_element, place: str, *, timeout_seconds: int) -> None:
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+
+    code = place.strip().upper()
+    _replace_input_value(input_element, _ctrip_display_name(code))
+    selector = (
+        '.cflt-poi-selector-new .address'
+        f'[data-u_remark*="Code:{code}"]'
+    )
+    wait = WebDriverWait(driver, timeout_seconds)
+
+    def visible_match(current_driver):
+        return next(
+            (
+                candidate
+                for candidate in current_driver.find_elements(By.CSS_SELECTOR, selector)
+                if candidate.is_displayed()
+            ),
+            False,
+        )
+
+    candidate = wait.until(visible_match)
+    _click_ctrip_element(driver, candidate)
+    wait.until(lambda _driver: f"({code})" in (input_element.get_attribute("value") or "").upper())
+
+
+def _select_ctrip_travel_date(driver, date_input, travel_date, *, timeout_seconds: int) -> None:
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.support.ui import WebDriverWait
+
+    expected_value = travel_date.isoformat()
+    target_selector = f'[data-testid="date-day-{expected_value}"]'
+    wait = WebDriverWait(driver, timeout_seconds)
+    _click_ctrip_element(driver, date_input)
+    wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, ".calendar-modal")))
+
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        targets = driver.find_elements(By.CSS_SELECTOR, target_selector)
+        for target in targets:
+            if target.is_displayed() and "date-disabled" not in (target.get_attribute("class") or ""):
+                day_label = target.find_element(By.CLASS_NAME, "date-d")
+                _click_ctrip_element(driver, day_label)
+                wait.until(lambda _driver: date_input.get_attribute("value") == expected_value)
+                return
+
+        next_buttons = [
+            button
+            for button in driver.find_elements(By.CSS_SELECTOR, ".calendar-modal .next-ico")
+            if button.is_displayed()
+        ]
+        if not next_buttons:
+            break
+        _click_ctrip_element(driver, next_buttons[-1])
+        time.sleep(0.2)
+
+    raise RuntimeError(f"Ctrip date picker could not select {expected_value}.")
+
+
+def _click_ctrip_element(driver, element) -> None:
+    from selenium.common.exceptions import ElementClickInterceptedException
+
+    try:
+        element.click()
+        return
+    except ElementClickInterceptedException:
+        driver.execute_script(
+            """
+            document.querySelectorAll("iframe#stageFrame").forEach((frame) => {
+                const style = window.getComputedStyle(frame);
+                if (style.position === "fixed" && Number(style.opacity) === 0) {
+                    frame.remove();
+                }
+            });
+            """
+        )
+    try:
+        element.click()
+    except ElementClickInterceptedException:
+        driver.execute_script("arguments[0].click();", element)
 
 
 def _replace_input_value(element, value: str) -> None:
@@ -869,6 +974,7 @@ def _replace_input_value(element, value: str) -> None:
 
 _CTRIP_DISPLAY_NAMES = {
     "SIN": "新加坡",
+    "CJU": "济州岛",
     "TFU": "成都",
     "CTU": "成都",
     "BJS": "北京",
@@ -881,6 +987,29 @@ _CTRIP_DISPLAY_NAMES = {
 
 def _ctrip_display_name(value: str) -> str:
     return _CTRIP_DISPLAY_NAMES.get(value.strip().upper(), value)
+
+
+def _ctrip_airport_matches_request(observed_code: object, requested_code: str) -> bool:
+    observed = str(observed_code or "").strip().upper()
+    requested = requested_code.strip().upper()
+    if not observed:
+        return False
+    if observed == requested:
+        return True
+
+    from .places import get_airport_index
+
+    airport_index = get_airport_index()
+    observed_airport = airport_index.resolve(observed)
+    requested_airport = airport_index.resolve(requested)
+    if observed_airport is None or requested_airport is None:
+        return False
+    return bool(
+        observed_airport.city
+        and requested_airport.city
+        and observed_airport.country == requested_airport.country
+        and observed_airport.city.casefold() == requested_airport.city.casefold()
+    )
 
 
 def _lowest_price(price_list: list[dict[str, Any]]) -> float | None:

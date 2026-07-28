@@ -36,6 +36,14 @@ def test_ctrip_route_search_tool_keeps_time_preference_from_query():
     )
 
 
+def test_ctrip_route_search_tool_normalises_chinese_airport_name():
+    result = CtripRouteSearchTool().search("CTU 济州岛 2026-07-31 flight price")[0]
+
+    assert result.url == (
+        "ctrip-selenium://flight?origin=CTU&destination=CJU&travel_date=2026-07-31&currency=CNY"
+    )
+
+
 def test_ctrip_selenium_url_round_trip():
     intent = FlightSearchIntent(
         origin="SIN",
@@ -152,6 +160,102 @@ def test_parse_ctrip_batch_search_payload_extracts_lowest_price_evidence():
     }
 
 
+def test_parse_ctrip_payload_uses_observed_departure_date_instead_of_requested_date():
+    intent = FlightSearchIntent(
+        origin="SIN",
+        destination="TFU",
+        travel_date=date(2026, 7, 10),
+        currency="CNY",
+    )
+    payload = {
+        "data": {
+            "flightItineraryList": [
+                _ctrip_itinerary(
+                    "3U3920",
+                    "3U3919",
+                    adult_price=900,
+                    adult_tax=100,
+                    first_departure_time="2026-07-09 08:10:00",
+                )
+            ]
+        }
+    }
+
+    evidence = parse_ctrip_batch_search_payload(
+        payload,
+        intent,
+        source_url="https://flights.ctrip.com/test",
+        direct_only=False,
+        max_results=5,
+    )
+
+    assert evidence[0].travel_date == date(2026, 7, 9)
+
+
+def test_parse_ctrip_payload_rejects_response_for_another_destination():
+    intent = FlightSearchIntent(
+        origin="SIN",
+        destination="CJU",
+        travel_date=date(2026, 7, 9),
+        currency="CNY",
+    )
+    payload = {
+        "data": {
+            "flightItineraryList": [
+                _ctrip_itinerary(
+                    "3U3920",
+                    "3U3919",
+                    adult_price=900,
+                    adult_tax=100,
+                )
+            ]
+        }
+    }
+
+    evidence = parse_ctrip_batch_search_payload(
+        payload,
+        intent,
+        source_url="https://flights.ctrip.com/test",
+        direct_only=False,
+        max_results=5,
+    )
+
+    assert evidence == []
+
+
+def test_parse_ctrip_payload_accepts_airport_in_requested_city():
+    intent = FlightSearchIntent(
+        origin="SIN",
+        destination="CTU",
+        travel_date=date(2026, 7, 9),
+        currency="CNY",
+    )
+    payload = {
+        "data": {
+            "flightItineraryList": [
+                _ctrip_itinerary(
+                    "3U3920",
+                    "3U3919",
+                    adult_price=900,
+                    adult_tax=100,
+                )
+            ]
+        }
+    }
+
+    evidence = parse_ctrip_batch_search_payload(
+        payload,
+        intent,
+        source_url="https://flights.ctrip.com/test",
+        direct_only=False,
+        max_results=5,
+    )
+
+    assert len(evidence) == 1
+    assert evidence[0].destination == "CTU"
+    assert evidence[0].metadata["arrival_airport_code"] == "TFU"
+
+
 def test_parse_ctrip_batch_search_payload_keeps_full_transfer_itinerary():
     intent = FlightSearchIntent(origin="SIN", destination="TFU", travel_date=date(2026, 7, 9), currency="CNY")
     payload = {
@@ -264,6 +368,8 @@ def test_parse_ctrip_batch_search_payload_prioritises_time_preference_before_pri
                     adult_price=900,
                     adult_tax=126,
                     first_departure_time="2026-07-10 20:55:00",
+                    first_departure_code="NKG",
+                    final_arrival_code="SIN",
                 ),
                 _ctrip_itinerary(
                     "3U6916",
@@ -271,6 +377,8 @@ def test_parse_ctrip_batch_search_payload_prioritises_time_preference_before_pri
                     adult_price=1200,
                     adult_tax=118,
                     first_departure_time="2026-07-10 06:50:00",
+                    first_departure_code="NKG",
+                    final_arrival_code="SIN",
                 ),
             ]
         }
@@ -307,6 +415,8 @@ def test_ctrip_evidence_without_requested_time_does_not_satisfy_preference():
                     adult_price=900,
                     adult_tax=126,
                     first_departure_time="2026-07-10 20:55:00",
+                    first_departure_code="NKG",
+                    final_arrival_code="SIN",
                 )
             ]
         }
@@ -686,6 +796,8 @@ def _ctrip_itinerary(
     adult_price: int,
     adult_tax: int,
     first_departure_time: str = "2026-07-09 12:05:00",
+    first_departure_code: str = "SIN",
+    final_arrival_code: str = "TFU",
 ):
     return {
         "itineraryId": f"{first_flight_no}_1783569900000,{second_flight_no}_1783598400000",
@@ -698,7 +810,7 @@ def _ctrip_itinerary(
                         "marketAirlineName": "test-airline",
                         "departureDateTime": first_departure_time,
                         "arrivalDateTime": "2026-07-09 16:00:00",
-                        "departureAirportCode": "SIN",
+                        "departureAirportCode": first_departure_code,
                         "arrivalAirportCode": "HAK",
                     },
                     {
@@ -707,7 +819,7 @@ def _ctrip_itinerary(
                         "departureDateTime": "2026-07-09 20:20:00",
                         "arrivalDateTime": "2026-07-09 22:25:00",
                         "departureAirportCode": "HAK",
-                        "arrivalAirportCode": "TFU",
+                        "arrivalAirportCode": final_arrival_code,
                     },
                 ],
             }

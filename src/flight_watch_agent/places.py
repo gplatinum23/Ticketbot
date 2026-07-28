@@ -428,6 +428,8 @@ _AIRPORT_QUERY_ALIASES: dict[str, AirportQuery] = {
     "南京禄口": AirportQuery(name="Nanjing Lukou", city="Nanjing", country="CN", raw_text="南京禄口"),
     "新加坡": AirportQuery(name="Singapore Changi", city="Singapore", country="SG", raw_text="新加坡"),
     "樟宜": AirportQuery(name="Singapore Changi", city="Singapore", country="SG", raw_text="樟宜"),
+    "济州岛": AirportQuery(iata="CJU", city="Jeju", country="KR", raw_text="济州岛"),
+    "济州": AirportQuery(iata="CJU", city="Jeju", country="KR", raw_text="济州"),
     "成都": AirportQuery(name="Chengdu Shuangliu", city="Chengdu", country="CN", raw_text="成都"),
     "成都双流": AirportQuery(name="Chengdu Shuangliu", city="Chengdu", country="CN", raw_text="成都双流"),
     "成都天府": AirportQuery(name="Chengdu Tianfu", city="Chengdu", country="CN", raw_text="成都天府"),
