@@ -4,6 +4,7 @@ import threading
 from datetime import date, datetime, timedelta, timezone
 
 from flight_watch_agent.models import FlightEvidence, FlightOption, FlightSearchIntent, SearchResult, TrainOption
+from flight_watch_agent.feasibility import FeasibilityPolicy, FeasibilityStatus
 from flight_watch_agent.travel_plan_graph import (
     CandidateRoute,
     HubEndpointDecision,
@@ -14,7 +15,6 @@ from flight_watch_agent.travel_plan_graph import (
     _compute_wait_minutes,
     _flight_duration_minutes,
     _flight_segment_count,
-    _minimum_transfer_minutes,
     _summarise_flight_option,
     build_travel_plan_graph,
 )
@@ -110,10 +110,12 @@ def test_flight_metrics_include_cross_day_duration_and_internal_segments():
     assert _flight_segment_count(option) == 2
 
 
-def test_independently_booked_flight_transfer_requires_two_hours():
-    assert _minimum_transfer_minutes("flight_flight") == 120
-    assert _minimum_transfer_minutes("train_flight") == 120
-    assert _minimum_transfer_minutes("train_train") == 60
+def test_feasibility_policy_centralises_connection_buffers():
+    policy = FeasibilityPolicy()
+
+    assert policy.flight_flight_same_airport_domestic_minutes == 120
+    assert policy.train_flight_domestic_minutes == 120
+    assert policy.train_train_minutes == 60
 
 
 def test_wait_minutes_uses_full_dates_for_overnight_transfer():
@@ -147,8 +149,8 @@ class HubExtractor:
                 url=url,
                 price=900.0,
                 currency="CNY",
-                departure_time=datetime(2026, 7, 10, 11, 40, tzinfo=CHINA_LOCAL_TIME),
-                arrival_time=datetime(2026, 7, 10, 16, 30, tzinfo=CHINA_LOCAL_TIME),
+                departure_time=datetime(2026, 7, 10, 12, 40, tzinfo=CHINA_LOCAL_TIME),
+                arrival_time=datetime(2026, 7, 10, 17, 30, tzinfo=CHINA_LOCAL_TIME),
                 captured_at=datetime(2026, 7, 9, 9, 0, tzinfo=timezone.utc),
                 origin="SHA",
                 destination="SIN",
@@ -233,7 +235,7 @@ class MultiStrategyExtractor:
         data = {
             "https://example.com/sin-kmg": ("SIN", "KMG", "TR100", 600.0, 9, 30, 12, 0),
             "https://example.com/nkg-can": ("NKG", "CAN", "CZ100", 400.0, 8, 0, 10, 0),
-            "https://example.com/can-sin": ("CAN", "SIN", "CZ200", 500.0, 13, 0, 17, 0),
+            "https://example.com/can-sin": ("CAN", "SIN", "CZ200", 500.0, 13, 30, 17, 30),
         }
         if url not in data:
             return []
@@ -424,6 +426,10 @@ def test_travel_plan_graph_builds_flight_flight_route():
     assert len(flight_flight_routes) == 1
     assert flight_flight_routes[0].total_price == 900.0
     assert "Flight+Flight via CAN" in flight_flight_routes[0].summary
+    assert (
+        flight_flight_routes[0].feasibility.status
+        == FeasibilityStatus.UNCERTAIN
+    )
 
 
 def test_travel_plan_graph_reuses_same_flight_query_across_strategies():

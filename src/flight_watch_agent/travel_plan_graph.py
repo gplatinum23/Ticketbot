@@ -36,6 +36,11 @@ from .flight_react import (
     build_react_flight_search_graph,
     invoke_react_flight_search,
 )
+from .feasibility import (
+    FeasibilityResult,
+    FeasibilityStatus,
+    RouteFeasibilityEngine,
+)
 from .ground_transfers import (
     GroundTransfer,
     GroundTransferProvider,
@@ -149,6 +154,7 @@ class CandidateRoute:
     total_duration_minutes: int | None = None
     segment_count: int | None = None
     score: float | None = None
+    feasibility: FeasibilityResult | None = None
 
 
 class TravelPlanState(TypedDict, total=False):
@@ -173,6 +179,7 @@ class TravelPlanState(TypedDict, total=False):
     prefetched_direct_flight_result: ToolResult[FlightSearchOutput]
     query_execution_stats: dict[str, int]
     candidate_routes: list[CandidateRoute]
+    rejected_candidate_routes: list[CandidateRoute]
     response: str
     warnings: list[str]
 
@@ -295,6 +302,7 @@ def build_travel_plan_graph(
     human_verification_handler=None,
     transfer_hubs: list[str] | None = None,
     ground_transfer_provider: GroundTransferProvider | None = None,
+    feasibility_engine: RouteFeasibilityEngine | None = None,
 ):
     progress = get_progress_reporter(progress_reporter)
     evidence_verifier = verifier or FlightEvidenceVerifier()
@@ -313,6 +321,7 @@ def build_travel_plan_graph(
     if train_tool is None and train_provider is not None:
         train_tool = CachedTrainSearchTool(train_provider)
     transfer_provider = ground_transfer_provider or StaticGroundTransferProvider()
+    route_feasibility_engine = feasibility_engine or RouteFeasibilityEngine()
     graph = StateGraph(TravelPlanState)
 
     def classify_region(state: TravelPlanState) -> TravelPlanState:
@@ -648,6 +657,7 @@ def build_travel_plan_graph(
     def build_candidate_routes(state: TravelPlanState) -> TravelPlanState:
         progress.emit("构建候选路线...")
         routes: list[CandidateRoute] = []
+        all_edges = state.get("route_edges", [])
         for option in state.get("train_options", []):
             routes.append(
                 CandidateRoute(
@@ -656,6 +666,11 @@ def build_travel_plan_graph(
                     train_option=option,
                     total_price=option.lowest_price,
                     summary=_summarise_train_option(option),
+                    route_edges=_direct_edges_for_option(
+                        all_edges,
+                        option,
+                        strategy="direct_train",
+                    ),
                     total_duration_minutes=_parse_duration_minutes(option.duration),
                     segment_count=1,
                 )
@@ -669,6 +684,11 @@ def build_travel_plan_graph(
                     flight_option=option,
                     total_price=option.price,
                     summary=_summarise_flight_option(option),
+                    route_edges=_direct_edges_for_option(
+                        all_edges,
+                        option,
+                        strategy="direct_flight",
+                    ),
                     total_duration_minutes=_flight_duration_minutes(option),
                     segment_count=_flight_segment_count(option),
                 )
@@ -681,6 +701,32 @@ def build_travel_plan_graph(
         routes.extend(transfer_routes)
 
         return {**state, "candidate_routes": sorted(routes, key=_route_sort_key)}
+
+    def evaluate_route_feasibility(
+        state: TravelPlanState,
+    ) -> TravelPlanState:
+        progress.emit("校验路线可行性...")
+        usable: list[CandidateRoute] = []
+        rejected: list[CandidateRoute] = []
+        for route in state.get("candidate_routes", []):
+            result = route_feasibility_engine.evaluate(
+                route_type=route.route_type,
+                edges=route.route_edges or [],
+            )
+            evaluated = replace(route, feasibility=result)
+            if result.status == FeasibilityStatus.INFEASIBLE:
+                rejected.append(evaluated)
+            else:
+                usable.append(evaluated)
+        warnings = list(state.get("warnings", []))
+        if rejected:
+            warnings.append(f"infeasible_routes_filtered:{len(rejected)}")
+        return {
+            **state,
+            "candidate_routes": usable,
+            "rejected_candidate_routes": rejected,
+            "warnings": warnings,
+        }
 
     def rank_routes(state: TravelPlanState) -> TravelPlanState:
         progress.emit("排序候选路线...")
@@ -704,28 +750,52 @@ def build_travel_plan_graph(
         routes = state.get("candidate_routes", [])
         warnings = state.get("warnings", [])
         if not routes:
+            rejected = state.get("rejected_candidate_routes", [])
             warning_text = ""
             if warnings:
                 warning_text = " Warnings: " + "; ".join(warnings)
+            rejected_text = ""
+            if rejected:
+                reason_codes = sorted(
+                    {
+                        issue.code.value
+                        for route in rejected
+                        if route.feasibility is not None
+                        for issue in route.feasibility.issues
+                        if issue.severity == "error"
+                    }
+                )
+                reason_text = (
+                    f" Reasons: {', '.join(reason_codes)}."
+                    if reason_codes
+                    else ""
+                )
+                rejected_text = (
+                    f" {len(rejected)} route candidates were rejected by "
+                    "deterministic feasibility checks."
+                    + reason_text
+                )
             return {
                 **state,
                 "response": (
                     "No train or verified flight options found. "
                     "No usable public flight price evidence was found."
+                    + rejected_text
                     + warning_text
                 ),
             }
 
         lines = ["Top travel candidates:"]
         for index, route in enumerate(routes[:5], start=1):
+            route_summary = route.summary + _feasibility_suffix(route)
             if route.route_type == "train" and route.train_option:
-                lines.append(f"{index}. {route.summary}")
+                lines.append(f"{index}. {route_summary}")
                 continue
             if route.route_type == "train_flight":
-                lines.append(f"{index}. {route.summary}")
+                lines.append(f"{index}. {route_summary}")
                 continue
             if route.route_type in {"flight_train", "train_train", "flight_flight"}:
-                lines.append(f"{index}. {route.summary}")
+                lines.append(f"{index}. {route_summary}")
                 continue
 
             option = route.flight_option
@@ -733,7 +803,7 @@ def build_travel_plan_graph(
                 continue
             source_names = ", ".join(sorted({item.source_name for item in option.evidence}))
             lines.append(
-                f"{index}. {route.summary}; evidence={option.evidence_count}; "
+                f"{index}. {route_summary}; evidence={option.evidence_count}; "
                 f"sources={source_names}; reliability={option.reliability}"
             )
         if warnings:
@@ -748,6 +818,7 @@ def build_travel_plan_graph(
     graph.add_node("build_query_plan", build_query_plan)
     graph.add_node("execute_query_plan", execute_query_plan)
     graph.add_node("build_candidate_routes", build_candidate_routes)
+    graph.add_node("evaluate_route_feasibility", evaluate_route_feasibility)
     graph.add_node("rank_routes", rank_routes)
     graph.add_node("render_response", render_response)
 
@@ -759,7 +830,8 @@ def build_travel_plan_graph(
     graph.add_edge("validate_candidate_hubs", "build_query_plan")
     graph.add_edge("build_query_plan", "execute_query_plan")
     graph.add_edge("execute_query_plan", "build_candidate_routes")
-    graph.add_edge("build_candidate_routes", "rank_routes")
+    graph.add_edge("build_candidate_routes", "evaluate_route_feasibility")
+    graph.add_edge("evaluate_route_feasibility", "rank_routes")
     graph.add_edge("rank_routes", "render_response")
     graph.add_edge("render_response", END)
 
@@ -1152,6 +1224,19 @@ def _flight_edges_from_options(
     return edges
 
 
+def _direct_edges_for_option(
+    edges: list[RouteEdge],
+    option: TrainOption | FlightOption,
+    *,
+    strategy: str,
+) -> list[RouteEdge]:
+    return [
+        edge
+        for edge in edges
+        if edge.strategy == strategy and edge.raw_option == option
+    ][:1]
+
+
 def _build_two_leg_routes_from_edges(
     edges: list[RouteEdge],
     *,
@@ -1183,8 +1268,6 @@ def _build_two_leg_routes_from_edges(
                     second_edge,
                     ground_transfer_provider,
                 )
-                if ground_transfer is False:
-                    continue
                 transfer_edge = (
                     _route_edge_from_ground_transfer(
                         ground_transfer,
@@ -1194,25 +1277,14 @@ def _build_two_leg_routes_from_edges(
                     if isinstance(ground_transfer, GroundTransfer)
                     else None
                 )
-                required_minutes = _minimum_transfer_minutes(strategy)
-                if transfer_edge is not None:
-                    required_minutes = (
-                        transfer_edge.duration_minutes or 0
-                    ) + max(
-                        transfer_edge.buffer_minutes,
-                        _minimum_transfer_minutes(strategy),
-                    )
-                if (
-                    wait_minutes is not None
-                    and wait_minutes < required_minutes
-                ):
-                    continue
-                if wait_minutes is None:
-                    continue
                 total_price = (
                     first_edge.price
                     + second_edge.price
-                    + (transfer_edge.price or 0 if transfer_edge is not None else 0)
+                    + (
+                        (transfer_edge.price or 0)
+                        if transfer_edge is not None
+                        else 0
+                    )
                 )
                 total_duration_minutes = _route_elapsed_minutes(
                     first_edge,
@@ -1254,7 +1326,7 @@ def _build_two_leg_routes_from_edges(
                         ),
                     )
                 )
-    return sorted(routes, key=_route_sort_key)[:12]
+    return sorted(routes, key=_route_sort_key)
 
 
 def _summarise_two_leg_route(
@@ -1315,9 +1387,9 @@ def _ground_transfer_between_edges(
     first_edge: RouteEdge,
     second_edge: RouteEdge,
     provider: GroundTransferProvider,
-) -> GroundTransfer | None | bool:
+) -> GroundTransfer | None:
     if first_edge.arrival_time is None or second_edge.departure_time is None:
-        return False
+        return None
     origin = _edge_endpoint_place(first_edge, arrival=True)
     destination = _edge_endpoint_place(second_edge, arrival=False)
     if (
@@ -1335,9 +1407,7 @@ def _ground_transfer_between_edges(
     )
     if transfer is not None:
         return transfer
-    if same_physical_endpoint(origin, destination):
-        return None
-    return False
+    return None
 
 
 def _edge_endpoint_place(edge: RouteEdge, *, arrival: bool):
@@ -1492,14 +1562,6 @@ def _route_sort_key(route: CandidateRoute) -> tuple[int, float]:
     if route.total_price is None:
         return (1, float("inf"))
     return (0, route.total_price)
-
-
-def _minimum_transfer_minutes(strategy: str) -> int:
-    # Query-plan legs are independently booked products, so airport and
-    # intermodal transfers need more protection than a through train journey.
-    if strategy == "train_train":
-        return 60
-    return 120
 
 
 def _parse_duration_minutes(value: str | None) -> int | None:
@@ -2072,9 +2134,33 @@ def _route_payload(routes: list[CandidateRoute]) -> dict[str, object]:
                 "transfer_wait_minutes": route.transfer_wait_minutes,
                 "total_duration_minutes": route.total_duration_minutes,
                 "segment_count": route.segment_count,
+                "feasibility": (
+                    {
+                        "status": route.feasibility.status.value,
+                        "issues": [
+                            {
+                                "code": issue.code.value,
+                                "severity": issue.severity,
+                                "available_minutes": issue.available_minutes,
+                                "required_minutes": issue.required_minutes,
+                            }
+                            for issue in route.feasibility.issues
+                        ],
+                    }
+                    if route.feasibility is not None
+                    else None
+                ),
             }
         )
     return {"routes": serialized}
+
+
+def _feasibility_suffix(route: CandidateRoute) -> str:
+    result = route.feasibility
+    if result is None or result.status == FeasibilityStatus.FEASIBLE:
+        return ""
+    issue_codes = ",".join(issue.code.value for issue in result.issues)
+    return f"; feasibility={result.status.value}({issue_codes})"
 
 
 def _hub_payload(hubs: list[CandidateHub]) -> list[dict[str, object]]:

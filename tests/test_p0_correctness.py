@@ -7,6 +7,11 @@ import pytest
 from flight_watch_agent.agent_models import RouteEdge
 from flight_watch_agent.ctrip import _parse_ctrip_datetime
 from flight_watch_agent.flight_react import FlightEvidenceVerifier
+from flight_watch_agent.feasibility import (
+    FeasibilityReasonCode,
+    FeasibilityStatus,
+    RouteFeasibilityEngine,
+)
 from flight_watch_agent.ground_transfers import (
     StaticGroundTransferProvider,
     classify_connection,
@@ -298,7 +303,16 @@ def test_cross_city_connection_without_transfer_evidence_is_not_executable():
         ground_transfer_provider=StaticGroundTransferProvider(),
     )
 
-    assert routes == []
+    assert len(routes) == 1
+    result = RouteFeasibilityEngine().evaluate(
+        route_type=routes[0].route_type,
+        edges=routes[0].route_edges or [],
+    )
+    assert result.status == FeasibilityStatus.INFEASIBLE
+    assert any(
+        issue.code == FeasibilityReasonCode.CROSS_CITY_TRANSFER_UNSUPPORTED
+        for issue in result.issues
+    )
 
 
 def _flight_evidence(
