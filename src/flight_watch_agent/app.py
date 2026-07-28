@@ -13,9 +13,16 @@ from .llm import build_default_llm
 from .progress import ProgressReporter
 from .request_graph import build_travel_plan_request_graph
 from .trains import Mcp12306TrainProvider
-from .travel_plan_graph import build_travel_plan_graph
+from .travel_plan_graph import build_react_flight_search_tool, build_travel_plan_graph
 from .travel_plan_graph import LlmHubPlanner
 from .travel_plan_graph import LlmRoutePlanner
+from .travel_tools import (
+    CachedTrainSearchTool,
+    InMemoryToolCache,
+    ToolCachePolicy,
+    as_langchain_flight_tool,
+    as_langchain_train_tool,
+)
 
 
 def build_default_request_agent(
@@ -53,12 +60,18 @@ def build_default_travel_plan_agent(
     load_env_file()
     llm = llm or build_default_llm()
     fast_llm = fast_llm or _build_fast_llm(llm)
+    evidence_judge = LlmFlightEvidenceJudge(fast_llm)
+    flight_tool = build_default_flight_query_tool(
+        evidence_judge=evidence_judge,
+        action_planner=LlmFlightActionPlanner(fast_llm),
+        progress_reporter=progress_reporter,
+        human_verification_handler=human_verification_handler,
+        cache=_build_tool_cache(),
+    )
     graph = build_travel_plan_graph(
-        web_search=build_default_flight_web_search_tool(),
-        page_extractor=build_default_flight_page_extractor(),
-        train_provider=Mcp12306TrainProvider() if include_train else None,
-        evidence_judge=LlmFlightEvidenceJudge(fast_llm),
-        flight_action_planner=LlmFlightActionPlanner(fast_llm),
+        flight_tool=flight_tool,
+        train_tool=build_default_train_query_tool() if include_train else None,
+        evidence_judge=evidence_judge,
         hub_planner=LlmHubPlanner(fast_llm),
         route_planner=LlmRoutePlanner(_build_route_llm(fast_llm)),
         progress_reporter=progress_reporter,
@@ -94,6 +107,39 @@ def build_default_flight_search_agent(
 
 def build_default_flight_web_search_tool():
     return CompositeWebSearchTool([CtripRouteSearchTool()])
+
+
+def build_default_flight_query_tool(
+    *,
+    evidence_judge=None,
+    action_planner=None,
+    progress_reporter: ProgressReporter | None = None,
+    human_verification_handler=None,
+    cache: InMemoryToolCache | None = None,
+):
+    return build_react_flight_search_tool(
+        web_search=build_default_flight_web_search_tool(),
+        page_extractor=build_default_flight_page_extractor(),
+        evidence_judge=evidence_judge,
+        action_planner=action_planner,
+        progress_reporter=progress_reporter,
+        human_verification_handler=human_verification_handler,
+        cache=cache or _build_tool_cache(),
+    )
+
+
+def build_default_train_query_tool():
+    return CachedTrainSearchTool(
+        Mcp12306TrainProvider(),
+        cache=_build_tool_cache(),
+    )
+
+
+def build_default_agent_tools(*, include_train: bool = True):
+    tools = [as_langchain_flight_tool(build_default_flight_query_tool())]
+    if include_train:
+        tools.append(as_langchain_train_tool(build_default_train_query_tool()))
+    return tools
 
 
 def build_default_flight_page_extractor():
@@ -133,6 +179,23 @@ def _config_list(name: str) -> list[str]:
     if not value:
         return []
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _build_tool_cache() -> InMemoryToolCache:
+    return InMemoryToolCache(
+        ToolCachePolicy(
+            ttl_seconds=int(
+                get_config("FLIGHT_WATCH_TOOL_CACHE_TTL_SECONDS", "300") or "300"
+            ),
+            max_entries=int(
+                get_config("FLIGHT_WATCH_TOOL_CACHE_MAX_ENTRIES", "512") or "512"
+            ),
+            cache_no_results=_config_bool(
+                "FLIGHT_WATCH_TOOL_CACHE_NO_RESULTS",
+                default=True,
+            ),
+        )
+    )
 
 
 def _build_fast_llm(default_llm):

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Protocol, TypedDict
 
@@ -44,6 +45,23 @@ from .places import (
     station_city_for_airport,
 )
 from .progress import ProgressReporter, get_progress_reporter
+from .travel_tools import (
+    CachedFlightSearchTool,
+    CachedTrainSearchTool,
+    FlightSearchOutput,
+    FlightSearchRequest,
+    FlightSearchTool,
+    ToolError,
+    InMemoryToolCache,
+    ToolMetrics,
+    ToolResult,
+    ToolStatus,
+    TrainSearchOutput,
+    TrainSearchRequest,
+    TrainSearchTool,
+    classify_tool_error,
+    flight_tool_result_from_state,
+)
 
 
 class TrainProvider(Protocol):
@@ -145,18 +163,120 @@ class TravelPlanState(TypedDict, total=False):
     transfer_flight_options: list[FlightOption]
     flight_search_debug: dict[str, object]
     transfer_search_debug: dict[str, object]
-    prefetched_direct_flight_state: dict[str, object]
+    prefetched_direct_flight_result: ToolResult[FlightSearchOutput]
     query_execution_stats: dict[str, int]
     candidate_routes: list[CandidateRoute]
     response: str
     warnings: list[str]
 
 
-def build_travel_plan_graph(
+def build_react_flight_search_tool(
     *,
     web_search: WebSearchTool,
     page_extractor: PageExtractor,
+    evidence_judge: FlightEvidenceJudge | None = None,
+    action_planner: FlightActionPlanner | None = None,
+    verifier: FlightEvidenceVerifier | None = None,
+    progress_reporter: ProgressReporter | None = None,
+    human_verification_handler=None,
+    cache: InMemoryToolCache | None = None,
+) -> FlightSearchTool:
+    evidence_verifier = verifier or FlightEvidenceVerifier()
+    batch_evidence_judge = (
+        evidence_judge
+        if callable(getattr(evidence_judge, "judge_many", None))
+        else None
+    )
+    primary_graph = build_react_flight_search_graph(
+        web_search=web_search,
+        page_extractor=page_extractor,
+        evidence_judge=None if batch_evidence_judge is not None else evidence_judge,
+        action_planner=action_planner,
+        verifier=evidence_verifier,
+        progress_reporter=progress_reporter,
+    )
+    fallback_graph = (
+        build_react_flight_search_graph(
+            web_search=web_search,
+            page_extractor=page_extractor,
+            evidence_judge=evidence_judge,
+            action_planner=action_planner,
+            verifier=evidence_verifier,
+            progress_reporter=progress_reporter,
+        )
+        if batch_evidence_judge is not None
+        else primary_graph
+    )
+
+    def run_batch(
+        requests: list[FlightSearchRequest] | tuple[FlightSearchRequest, ...],
+    ) -> list[ToolResult[FlightSearchOutput]]:
+        states: dict[str, dict[str, object]] = {}
+        timings: dict[str, tuple[datetime, float]] = {}
+        failed: dict[str, ToolResult[FlightSearchOutput]] = {}
+        for request in requests:
+            timings[request.request_id] = (datetime.now(timezone.utc), time.monotonic())
+            try:
+                states[request.request_id] = invoke_react_flight_search(
+                    primary_graph,
+                    {"intent": request.to_intent()},
+                    human_verification_handler=human_verification_handler,
+                )
+            except Exception as exc:
+                started_at, started_monotonic = timings[request.request_id]
+                failed[request.request_id] = ToolResult(
+                    status=ToolStatus.ERROR,
+                    data=None,
+                    error=classify_tool_error(exc),
+                    metrics=ToolMetrics(
+                        request_id=request.request_id,
+                        started_at=started_at,
+                        latency_ms=max(
+                            0,
+                            round((time.monotonic() - started_monotonic) * 1000),
+                        ),
+                        cache_hit=False,
+                        attempts=1,
+                        backend="ctrip_react",
+                    ),
+                )
+
+        if batch_evidence_judge is not None and states:
+            states = _batch_judge_flight_searches(
+                states,
+                batch_evidence_judge,
+                evidence_verifier,
+                fallback_graph,
+                human_verification_handler=human_verification_handler,
+            )
+
+        results: list[ToolResult[FlightSearchOutput]] = []
+        for request in requests:
+            if request.request_id in failed:
+                results.append(failed[request.request_id])
+                continue
+            state = _limit_flight_tool_state(states[request.request_id], request)
+            started_at, started_monotonic = timings[request.request_id]
+            results.append(
+                flight_tool_result_from_state(
+                    request,
+                    state,
+                    started_at=started_at,
+                    started_monotonic=started_monotonic,
+                )
+            )
+        return results
+
+    return CachedFlightSearchTool(run_batch, cache=cache)
+
+
+def build_travel_plan_graph(
+    *,
+    web_search: WebSearchTool | None = None,
+    page_extractor: PageExtractor | None = None,
     train_provider: TrainProvider | None = None,
+    flight_tool: FlightSearchTool | None = None,
+    train_tool: TrainSearchTool | None = None,
     evidence_judge: FlightEvidenceJudge | None = None,
     flight_action_planner: FlightActionPlanner | None = None,
     verifier: FlightEvidenceVerifier | None = None,
@@ -170,31 +290,20 @@ def build_travel_plan_graph(
 ):
     progress = get_progress_reporter(progress_reporter)
     evidence_verifier = verifier or FlightEvidenceVerifier()
-    batch_evidence_judge = (
-        evidence_judge
-        if callable(getattr(evidence_judge, "judge_many", None))
-        else None
-    )
-    react_search = build_react_flight_search_graph(
-        web_search=web_search,
-        page_extractor=page_extractor,
-        evidence_judge=None if batch_evidence_judge is not None else evidence_judge,
-        action_planner=flight_action_planner,
-        verifier=evidence_verifier,
-        progress_reporter=progress,
-    )
-    fallback_react_search = (
-        build_react_flight_search_graph(
+    if flight_tool is None:
+        if web_search is None or page_extractor is None:
+            raise ValueError("flight_tool or both web_search and page_extractor are required.")
+        flight_tool = build_react_flight_search_tool(
             web_search=web_search,
             page_extractor=page_extractor,
             evidence_judge=evidence_judge,
             action_planner=flight_action_planner,
             verifier=evidence_verifier,
             progress_reporter=progress,
+            human_verification_handler=human_verification_handler,
         )
-        if batch_evidence_judge is not None
-        else react_search
-    )
+    if train_tool is None and train_provider is not None:
+        train_tool = CachedTrainSearchTool(train_provider)
     graph = StateGraph(TravelPlanState)
 
     def classify_region(state: TravelPlanState) -> TravelPlanState:
@@ -216,10 +325,8 @@ def build_travel_plan_graph(
             return {}
         progress.emit("并行查询直达机票...")
         return {
-            "prefetched_direct_flight_state": invoke_react_flight_search(
-                react_search,
-                {"intent": state["intent"]},
-                human_verification_handler=human_verification_handler,
+            "prefetched_direct_flight_result": flight_tool.search(
+                FlightSearchRequest.from_intent(state["intent"])
             )
         }
 
@@ -371,137 +478,149 @@ def build_travel_plan_graph(
         route_edges: list[RouteEdge] = []
         flight_search_debug: dict[str, object] = _empty_flight_debug()
         transfer_search_debug: dict[str, object] = {"hubs": [], "searched": []}
-        train_query_cache: dict[tuple[object, ...], tuple[list[TrainOption], str | None]] = {}
-        flight_query_cache: dict[tuple[object, ...], dict] = {}
-        prefetched_direct = state.get("prefetched_direct_flight_state")
-        if prefetched_direct is not None:
-            direct_key = _query_cache_key("flight", state["intent"])
-            flight_query_cache[direct_key] = prefetched_direct
-        flight_item_keys: list[tuple[QueryPlanItem, tuple[object, ...]]] = []
-        flight_evidence_llm_batches = 0
-        consumed_train_keys: set[tuple[object, ...]] = set()
         train_items = [
             item
             for item in query_plan.items
-            if item.executable and item.mode == "train" and train_provider is not None
+            if item.executable and item.mode == "train" and train_tool is not None
         ]
-        train_executor = ThreadPoolExecutor(max_workers=1) if train_items else None
-        train_future = (
-            train_executor.submit(
-                _prefetch_train_queries,
-                train_items,
-                state["intent"],
-                train_provider,
-            )
-            if train_executor is not None and train_provider is not None
-            else None
-        )
-        execution_items = [
-            item for item in query_plan.items if item.executable and item.mode == "flight"
-        ] + [
-            item for item in query_plan.items if item.executable and item.mode == "train"
-        ] + [
-            item for item in query_plan.items if not item.executable
+        flight_items = [
+            item
+            for item in query_plan.items
+            if item.executable and item.mode == "flight"
+        ]
+        train_requests = [
+            _train_request_for_query_item(item)
+            for item in train_items
+        ]
+        flight_requests = [
+            FlightSearchRequest.from_intent(_intent_for_query_item(state["intent"], item))
+            for item in flight_items
         ]
 
-        for item in execution_items:
+        for item in [*flight_items, *train_items]:
+            progress.emit(_progress_message_for_query_item(item))
+        for item in query_plan.items:
             if not item.executable:
                 warnings.append(f"query_not_implemented:{item.query_id}")
-                continue
-            progress.emit(_progress_message_for_query_item(item))
-            query_intent = _intent_for_query_item(state["intent"], item)
-            cache_key = _query_cache_key(item.mode, query_intent)
-            if item.mode == "train":
-                if train_provider is None:
-                    continue
-                if train_future is not None:
-                    train_query_cache = train_future.result()
-                    train_future = None
-                    if train_executor is not None:
-                        train_executor.shutdown(wait=True)
-                        train_executor = None
-                cached_train = train_query_cache.get(cache_key, ([], None))
-                if cache_key in consumed_train_keys:
-                    progress.emit(_progress_reuse_message(item))
-                consumed_train_keys.add(cache_key)
-                best_options, train_error = cached_train
-                if train_error is not None:
-                    warnings.append(f"train_query_failed:{item.query_id}:{train_error}")
-                    continue
-                if item.strategy == "direct_train":
-                    train_options.extend(best_options)
-                elif item.strategy == "train_flight":
-                    transfer_train_options.extend(best_options)
-                route_edges.extend(_train_edges_from_options(best_options, item, state["intent"].currency))
-                continue
 
-            react_state = flight_query_cache.get(cache_key)
-            if react_state is None:
-                react_state = invoke_react_flight_search(
-                    react_search,
-                    {"intent": query_intent},
-                    human_verification_handler=human_verification_handler,
-                )
-                flight_query_cache[cache_key] = react_state
-            else:
+        train_executor = ThreadPoolExecutor(max_workers=1) if train_requests else None
+        train_future = (
+            train_executor.submit(train_tool.search_many, train_requests)
+            if train_executor is not None and train_tool is not None
+            else None
+        )
+        prefetched_result = state.get("prefetched_direct_flight_result")
+        prefetched_request_id = (
+            prefetched_result.metrics.request_id
+            if prefetched_result is not None
+            else None
+        )
+        pending_flight_requests = [
+            request
+            for request in flight_requests
+            if request.request_id != prefetched_request_id
+        ]
+        pending_flight_results = flight_tool.search_many(pending_flight_requests)
+        pending_results_by_id = {
+            result.metrics.request_id: result
+            for result in pending_flight_results
+        }
+        flight_results = [
+            prefetched_result
+            if request.request_id == prefetched_request_id and prefetched_result is not None
+            else pending_results_by_id[request.request_id]
+            for request in flight_requests
+        ]
+        for item, result in zip(flight_items, flight_results, strict=True):
+            if result.metrics.cache_hit:
                 progress.emit(_progress_reuse_message(item))
-            flight_item_keys.append((item, cache_key))
-
-        if batch_evidence_judge is not None and flight_query_cache:
-            progress.emit("批量判断机票证据...")
-            flight_query_cache = _batch_judge_flight_searches(
-                flight_query_cache,
-                batch_evidence_judge,
-                evidence_verifier,
-                fallback_react_search,
-                human_verification_handler=human_verification_handler,
-            )
-            flight_evidence_llm_batches = int(
-                getattr(batch_evidence_judge, "last_batch_count", 0)
-            )
-
-        for item, cache_key in flight_item_keys:
-            react_state = flight_query_cache[cache_key]
-            flight_options = react_state.get("verified_flight_options", [])
+            if not result.ok:
+                warnings.append(_tool_failure_warning("flight", item, result.error))
+                continue
+            output = result.data or FlightSearchOutput(options=(), raw_state={})
+            react_state = output.raw_state
+            current_flight_options = list(output.options)
             if item.strategy == "direct_flight":
-                verified_flight_options.extend(flight_options)
+                verified_flight_options.extend(current_flight_options)
                 flight_search_debug = _react_debug(react_state)
-                warnings.extend(react_state.get("warnings", []))
+                warnings.extend(result.warnings)
             elif item.strategy == "train_flight":
-                transfer_flight_options.extend(flight_options)
+                transfer_flight_options.extend(current_flight_options)
                 warnings.extend(
                     f"transfer_flight:{item.hub_id}:{warning}"
-                    for warning in react_state.get("warnings", [])
+                    for warning in result.warnings
                 )
-                _append_transfer_debug(transfer_search_debug, item, react_state, flight_options)
+                _append_transfer_debug(
+                    transfer_search_debug,
+                    item,
+                    react_state,
+                    current_flight_options,
+                )
             else:
                 warnings.extend(
                     f"{item.strategy}:{item.hub_id}:{warning}"
-                    for warning in react_state.get("warnings", [])
+                    for warning in result.warnings
                 )
-                _append_transfer_debug(transfer_search_debug, item, react_state, flight_options)
-            route_edges.extend(_flight_edges_from_options(flight_options, item))
+                _append_transfer_debug(
+                    transfer_search_debug,
+                    item,
+                    react_state,
+                    current_flight_options,
+                )
+            route_edges.extend(_flight_edges_from_options(current_flight_options, item))
 
-        if train_future is not None:
-            train_query_cache = train_future.result()
+        train_results = train_future.result() if train_future is not None else []
         if train_executor is not None:
             train_executor.shutdown(wait=True)
 
+        for item, result in zip(train_items, train_results, strict=True):
+            if result.metrics.cache_hit:
+                progress.emit(_progress_reuse_message(item))
+            if not result.ok:
+                warnings.append(_tool_failure_warning("train", item, result.error))
+                continue
+            output = result.data or TrainSearchOutput(options=())
+            best_options = list(output.options[:3])
+            if item.strategy == "direct_train":
+                train_options.extend(best_options)
+            elif item.strategy == "train_flight":
+                transfer_train_options.extend(best_options)
+            route_edges.extend(
+                _train_edges_from_options(best_options, item, state["intent"].currency)
+            )
+
         planned_train_queries = sum(item.executable and item.mode == "train" for item in query_plan.items)
         planned_flight_queries = sum(item.executable and item.mode == "flight" for item in query_plan.items)
+        unique_train_queries = len({request.request_id for request in train_requests})
+        unique_flight_queries = len({request.request_id for request in flight_requests})
+        train_cache_hits = len({
+            result.metrics.request_id
+            for result in train_results
+            if result.metrics.cache_hit
+        })
+        flight_cache_hits = len({
+            result.metrics.request_id
+            for result in flight_results
+            if result.metrics.cache_hit
+        })
         execution_stats = {
             "planned_train_queries": planned_train_queries,
-            "unique_train_queries": len(train_query_cache),
-            "reused_train_queries": planned_train_queries - len(train_query_cache),
+            "unique_train_queries": unique_train_queries,
+            "reused_train_queries": planned_train_queries - unique_train_queries,
+            "train_cache_hits": train_cache_hits,
             "planned_flight_queries": planned_flight_queries,
-            "unique_flight_queries": len(flight_query_cache),
-            "reused_flight_queries": planned_flight_queries - len(flight_query_cache),
-            "flight_evidence_llm_batches": flight_evidence_llm_batches,
+            "unique_flight_queries": unique_flight_queries,
+            "reused_flight_queries": planned_flight_queries - unique_flight_queries,
+            "flight_cache_hits": flight_cache_hits,
+            "flight_evidence_llm_batches": int(
+                getattr(evidence_judge, "last_batch_count", 0)
+            ),
         }
         progress.emit(
             "查询复用统计: "
-            f"机票 {planned_flight_queries} 条计划/{len(flight_query_cache)} 次实际查询，"
-            f"火车 {planned_train_queries} 条计划/{len(train_query_cache)} 次实际查询"
+            f"机票 {planned_flight_queries} 条计划/{unique_flight_queries} 个唯一请求，"
+            f"火车 {planned_train_queries} 条计划/{unique_train_queries} 个唯一请求；"
+            f"缓存命中 机票 {flight_cache_hits}/火车 {train_cache_hits}"
         )
 
         return {
@@ -839,48 +958,73 @@ def _intent_for_query_item(base_intent: FlightSearchIntent, item: QueryPlanItem)
     )
 
 
-def _query_cache_key(mode: str, intent: FlightSearchIntent) -> tuple[object, ...]:
-    return (
-        mode,
-        intent.origin.strip().casefold(),
-        intent.destination.strip().casefold(),
-        intent.travel_date,
-        (intent.time_preference or "").strip().casefold(),
-        intent.budget_threshold,
-        intent.currency.strip().upper(),
-        intent.max_segments,
+def _train_request_for_query_item(
+    item: QueryPlanItem,
+) -> TrainSearchRequest:
+    return TrainSearchRequest(
+        origin=item.origin,
+        destination=item.destination,
+        travel_date=item.travel_date,
+        max_results=3,
     )
 
 
-def _prefetch_train_queries(
-    items: list[QueryPlanItem],
-    base_intent: FlightSearchIntent,
-    train_provider: TrainProvider,
-) -> dict[tuple[object, ...], tuple[list[TrainOption], str | None]]:
-    cache: dict[tuple[object, ...], tuple[list[TrainOption], str | None]] = {}
-    for item in items:
-        query_intent = _intent_for_query_item(base_intent, item)
-        cache_key = _query_cache_key("train", query_intent)
-        if cache_key in cache:
-            continue
-        try:
-            options = train_provider.query_train_options(query_intent)
-            cache[cache_key] = (sorted(options, key=_train_sort_key)[:3], None)
-        except Exception as exc:
-            cache[cache_key] = ([], str(exc))
-    return cache
+def _tool_failure_warning(
+    mode: str,
+    item: QueryPlanItem,
+    error: ToolError | None,
+) -> str:
+    if error is None:
+        return f"{mode}_query_failed:{item.query_id}:unknown_error"
+    return (
+        f"{mode}_query_failed:{item.query_id}:"
+        f"{error.code.value}:retryable={str(error.retryable).lower()}:{error.message}"
+    )
+
+
+def _limit_flight_tool_state(
+    state: dict[str, object],
+    request: FlightSearchRequest,
+) -> dict[str, object]:
+    options = list(state.get("verified_flight_options", []))
+    if request.direct_only:
+        direct_options: list[FlightOption] = []
+        for option in options:
+            direct_evidence = [
+                evidence
+                for evidence in option.evidence
+                if isinstance(evidence.metadata, dict)
+                and evidence.metadata.get("is_direct") is True
+            ]
+            if not direct_evidence:
+                continue
+            lowest = min(direct_evidence, key=lambda evidence: evidence.price)
+            direct_options.append(
+                replace(
+                    option,
+                    price=lowest.price,
+                    departure_time=lowest.departure_time,
+                    arrival_time=lowest.arrival_time,
+                    evidence=direct_evidence,
+                )
+            )
+        options = direct_options
+    return {
+        **state,
+        "verified_flight_options": options[: request.max_results],
+    }
 
 
 def _batch_judge_flight_searches(
-    search_cache: dict[tuple[object, ...], dict],
+    search_cache: dict[str, dict],
     evidence_judge,
     verifier: FlightEvidenceVerifier,
     fallback_react_search,
     *,
     human_verification_handler=None,
-) -> dict[tuple[object, ...], dict]:
+) -> dict[str, dict]:
     requests: list[FlightEvidenceJudgeRequest] = []
-    request_keys: dict[str, tuple[object, ...]] = {}
+    request_keys: dict[str, str] = {}
     for query_index, (cache_key, react_state) in enumerate(search_cache.items()):
         evidence_by_url: dict[str, list] = {}
         for evidence in react_state.get("extracted_evidence", []):
@@ -922,13 +1066,13 @@ def _batch_judge_flight_searches(
             for cache_key, react_state in search_cache.items()
         }
 
-    judged_by_query: dict[tuple[object, ...], list] = {}
+    judged_by_query: dict[str, list] = {}
     for request_id, evidence in judged_by_request.items():
         cache_key = request_keys.get(request_id)
         if cache_key is not None:
             judged_by_query.setdefault(cache_key, []).extend(evidence)
 
-    updated: dict[tuple[object, ...], dict] = {}
+    updated: dict[str, dict] = {}
     for cache_key, react_state in search_cache.items():
         judged_evidence = judged_by_query.get(cache_key, [])
         verification_intent = _verification_intent_for_react_state(react_state)
@@ -1359,12 +1503,6 @@ def _enforce_dominance_order(routes: list[CandidateRoute]) -> list[CandidateRout
         )
         ordered.append(remaining.pop(next_index))
     return ordered
-
-
-def _train_sort_key(train: TrainOption) -> tuple[int, float]:
-    if train.lowest_price is None:
-        return (1, float("inf"))
-    return (0, train.lowest_price)
 
 
 def _compute_transfer_wait_minutes(train_arrive: str, flight_departure: datetime | None) -> int | None:

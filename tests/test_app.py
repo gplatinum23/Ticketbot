@@ -27,6 +27,8 @@ def test_default_travel_agent_uses_combined_hub_planner_and_batch_judge(monkeypa
     assert isinstance(captured["hub_planner"], LlmHubPlanner)
     assert isinstance(captured["evidence_judge"], LlmFlightEvidenceJudge)
     assert callable(captured["evidence_judge"].judge_many)
+    assert callable(captured["flight_tool"].search)
+    assert captured["train_tool"] is None
     assert "hub_proposer" not in captured
     assert "hub_endpoint_validator" not in captured
 

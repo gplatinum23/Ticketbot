@@ -100,6 +100,61 @@ FLIGHT_WATCH_CTRIP_REUSE_BROWSER=true
 
 程序默认读取项目根目录的 `.env`，系统环境变量优先。需要人工处理携程验证码时，应使用非无头浏览器。
 
+## 领域查询工具
+
+规划图通过两个稳定的领域工具访问外部数据：
+
+- `FlightSearchTool`：接收 `FlightSearchRequest`，返回 `ToolResult[FlightSearchOutput]`。
+- `TrainSearchTool`：接收 `TrainSearchRequest`，返回 `ToolResult[TrainSearchOutput]`。
+
+工具提供单次 `search()` 和批量 `search_many()` 接口。批量接口保持输入顺序、自动消除重复请求，并复用线程安全的 TTL/LRU 内存缓存。默认缓存 300 秒、最多 512 条；错误和需要人工操作的结果不会缓存。
+
+```python
+from datetime import date
+
+from flight_watch_agent.app import build_default_flight_query_tool
+from flight_watch_agent.travel_tools import FlightSearchRequest
+
+tool = build_default_flight_query_tool()
+result = tool.search(
+    FlightSearchRequest(
+        origin="CTU",
+        destination="CJU",
+        travel_date=date(2026, 7, 31),
+    )
+)
+if result.ok and result.data:
+    print(result.data.options)
+elif result.error:
+    print(result.error.code, result.error.retryable, result.error.message)
+```
+
+统一状态为 `success`、`no_results`、`human_action_required` 和 `error`。错误码包括：
+
+```text
+invalid_input, timeout, captcha_required, login_required, rate_limited,
+route_mismatch, parse_failed, tool_unavailable, internal_error
+```
+
+每个结果同时返回 `request_id`、耗时、缓存命中、尝试次数和后端名称。可通过以下配置调整缓存：
+
+```dotenv
+FLIGHT_WATCH_TOOL_CACHE_TTL_SECONDS=300
+FLIGHT_WATCH_TOOL_CACHE_MAX_ENTRIES=512
+FLIGHT_WATCH_TOOL_CACHE_NO_RESULTS=true
+```
+
+需要注册给 LangChain Agent 时，可直接使用：
+
+```python
+from flight_watch_agent.app import build_default_agent_tools
+
+tools = build_default_agent_tools()
+# names: search_flights, search_trains
+```
+
+Agent 适配器只返回精简、可序列化的公开字段，不暴露浏览器状态或原始抓包。
+
 ## 使用
 
 ### 自然语言规划
