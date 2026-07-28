@@ -93,10 +93,12 @@ class RouteEdge:
     travel_date: date
     price: float | None
     currency: str = "CNY"
-    departure_time: datetime | str | None = None
-    arrival_time: datetime | str | None = None
+    departure_time: datetime | None = None
+    arrival_time: datetime | None = None
     duration_minutes: int | None = None
+    buffer_minutes: int = 0
     source: str = ""
+    reliability: str | None = None
     confidence: float = 1.0
     hub_id: str | None = None
     leg_index: int = 1

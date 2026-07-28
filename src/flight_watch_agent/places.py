@@ -4,8 +4,10 @@ import csv
 import json
 import re
 from dataclasses import dataclass
+from datetime import timedelta, timezone, tzinfo
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -44,6 +46,42 @@ class AirportQuery:
     iata: str | None = None
     country: str = ""
     raw_text: str | None = None
+
+
+PlaceKind = Literal["city", "airport", "station", "unknown"]
+PlaceResolutionRole = Literal["query", "actual", "any"]
+
+
+@dataclass(frozen=True)
+class CityAirportGroup:
+    city_id: str
+    query_code: str
+    display_name: str
+    english_name: str
+    country: str
+    airport_codes: tuple[str, ...]
+    aliases: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class PlaceRef:
+    """A typed location identity; query cities and actual airports never share an id."""
+
+    raw: str
+    kind: PlaceKind
+    canonical_id: str
+    display_name: str
+    city_id: str | None = None
+    city_name: str | None = None
+    country: str | None = None
+    query_code: str | None = None
+    airport_codes: tuple[str, ...] = ()
+    airport_code: str | None = None
+    station_code: str | None = None
+
+    @property
+    def known(self) -> bool:
+        return self.kind != "unknown"
 
 
 class StationIndex:
@@ -168,23 +206,175 @@ def get_airport_index() -> AirportIndex:
     return AirportIndex(_load_airport_records(DEFAULT_AIRPORT_FILE))
 
 
+def resolve_place(
+    value: str,
+    *,
+    role: PlaceResolutionRole = "any",
+) -> PlaceRef:
+    """Resolve a legacy place string without collapsing a city into one airport.
+
+    `query` interprets Ctrip city codes such as BJS/SHA/CTU as airport groups.
+    `actual` interprets evidence endpoint codes as physical airports.
+    """
+
+    raw = value
+    text = value.strip()
+    if not text:
+        return _unknown_place(raw)
+    upper = text.upper()
+
+    city_group = _city_group_for_alias(text)
+    if city_group is not None and (
+        role == "query"
+        or upper == city_group.query_code
+        and upper not in get_airport_index().by_iata
+        or not re.fullmatch(r"[A-Za-z0-9]{3}", text)
+    ):
+        return _city_place(raw, city_group)
+
+    airport = get_airport_index().resolve(text)
+    if airport is not None and airport.iata != "BJS":
+        group = _city_group_for_airport(airport)
+        return PlaceRef(
+            raw=raw,
+            kind="airport",
+            canonical_id=f"airport:{airport.iata}",
+            display_name=airport.name,
+            city_id=group.city_id if group else _generic_city_id(airport),
+            city_name=group.display_name if group else airport.city,
+            country=airport.country or None,
+            query_code=airport.iata,
+            airport_codes=(airport.iata,),
+            airport_code=airport.iata,
+        )
+
+    station = _station_record_for_value(text)
+    if station is not None:
+        group = _city_group_for_station(station)
+        return PlaceRef(
+            raw=raw,
+            kind="station",
+            canonical_id=f"station:{station.telecode}",
+            display_name=station.name,
+            city_id=group.city_id if group else f"city:CN:{station.city_name}",
+            city_name=group.display_name if group else station.city_name,
+            country="CN",
+            query_code=station.name,
+            airport_codes=group.airport_codes if group else (),
+            station_code=station.telecode,
+        )
+
+    if city_group is not None:
+        return _city_place(raw, city_group)
+    return _unknown_place(raw)
+
+
+def resolve_air_query_place(value: str) -> PlaceRef:
+    return resolve_place(value, role="query")
+
+
+def resolve_actual_airport(value: str | None) -> PlaceRef | None:
+    if not value:
+        return None
+    place = resolve_place(value, role="actual")
+    return place if place.kind == "airport" else None
+
+
+def resolve_station_place(value: str | None) -> PlaceRef | None:
+    if not value:
+        return None
+    station = _station_record_for_value(value)
+    if station is None:
+        return None
+    group = _city_group_for_station(station)
+    return PlaceRef(
+        raw=value,
+        kind="station",
+        canonical_id=f"station:{station.telecode}",
+        display_name=station.name,
+        city_id=group.city_id if group else f"city:CN:{station.city_name}",
+        city_name=group.display_name if group else station.city_name,
+        country="CN",
+        query_code=station.name,
+        airport_codes=group.airport_codes if group else (),
+        station_code=station.telecode,
+    )
+
+
+def air_endpoint_matches(requested: str | PlaceRef, observed: str | PlaceRef) -> bool:
+    requested_place = (
+        requested if isinstance(requested, PlaceRef) else resolve_air_query_place(requested)
+    )
+    observed_place = (
+        observed if isinstance(observed, PlaceRef) else resolve_place(observed, role="actual")
+    )
+    if requested_place.kind == "unknown" or observed_place.kind != "airport":
+        return False
+    if requested_place.kind == "airport":
+        return requested_place.airport_code == observed_place.airport_code
+    return bool(
+        requested_place.city_id
+        and observed_place.city_id
+        and requested_place.city_id == observed_place.city_id
+        and observed_place.airport_code in requested_place.airport_codes
+    )
+
+
+def query_endpoint_matches(
+    requested: str | PlaceRef,
+    observed: str | PlaceRef,
+) -> bool:
+    requested_place = (
+        requested if isinstance(requested, PlaceRef) else resolve_air_query_place(requested)
+    )
+    observed_place = (
+        observed if isinstance(observed, PlaceRef) else resolve_air_query_place(observed)
+    )
+    if not requested_place.known or not observed_place.known:
+        return False
+    if requested_place.kind == "airport":
+        return (
+            observed_place.kind == "airport"
+            and requested_place.airport_code == observed_place.airport_code
+        )
+    if observed_place.kind == "airport":
+        return bool(
+            requested_place.city_id == observed_place.city_id
+            and observed_place.airport_code in requested_place.airport_codes
+        )
+    return bool(
+        requested_place.city_id
+        and requested_place.city_id == observed_place.city_id
+    )
+
+
+def timezone_for_airport(value: str | None) -> tzinfo:
+    airport = resolve_actual_airport(value)
+    country = airport.country if airport is not None else None
+    offset_hours, label = _TIMEZONE_BY_COUNTRY.get(
+        country or "",
+        (0, "UTC"),
+    )
+    return timezone(timedelta(hours=offset_hours), label)
+
+
 def normalise_airport_code(value: str | None) -> str | None:
     if not value:
         return None
-    airport = get_airport_index().resolve(value)
-    if airport is not None:
-        return airport.iata
+    place = resolve_air_query_place(value)
+    if place.kind == "airport":
+        return place.airport_code
+    if place.kind == "city":
+        return place.query_code
 
     station = get_station_index().by_name.get(value.strip())
     if station is not None and station.city_name:
+        group = _city_group_for_station(station)
+        if group is not None:
+            return group.query_code
         city_airport = get_airport_index().resolve(station.city_name)
-        if city_airport is not None:
-            return city_airport.iata
-
-    text = value.strip()
-    if re.fullmatch(r"[A-Za-z]{3}", text):
-        return text.upper()
-    return text.upper()
+        return city_airport.iata if city_airport is not None else None
+    return None
 
 
 def normalise_train_query_place(value: str) -> str | None:
@@ -413,6 +603,159 @@ def _derive_airport_city(name: str) -> str | None:
     if first.casefold() in {"airport", "international", "regional"}:
         return None
     return first
+
+
+def _unknown_place(raw: str) -> PlaceRef:
+    text = raw.strip()
+    return PlaceRef(
+        raw=raw,
+        kind="unknown",
+        canonical_id=f"unknown:{text.casefold()}",
+        display_name=text,
+    )
+
+
+def _city_place(raw: str, group: CityAirportGroup) -> PlaceRef:
+    return PlaceRef(
+        raw=raw,
+        kind="city",
+        canonical_id=group.city_id,
+        display_name=group.display_name,
+        city_id=group.city_id,
+        city_name=group.display_name,
+        country=group.country,
+        query_code=group.query_code,
+        airport_codes=group.airport_codes,
+    )
+
+
+def _city_group_for_alias(value: str) -> CityAirportGroup | None:
+    key = _normalise_lookup_key(value)
+    return _CITY_GROUP_BY_ALIAS.get(key)
+
+
+def _city_group_for_airport(airport: AirportRecord) -> CityAirportGroup | None:
+    for group in _CITY_AIRPORT_GROUPS.values():
+        if airport.iata in group.airport_codes:
+            return group
+    airport_city = _normalise_lookup_key(airport.city or "")
+    for group in _CITY_AIRPORT_GROUPS.values():
+        if airport.country == group.country and airport_city == _normalise_lookup_key(group.english_name):
+            return group
+    return None
+
+
+def _city_group_for_station(station: StationRecord) -> CityAirportGroup | None:
+    key = _normalise_lookup_key(station.city_name)
+    return _CITY_GROUP_BY_ALIAS.get(key)
+
+
+def _station_record_for_value(value: str) -> StationRecord | None:
+    index = get_station_index()
+    text = value.strip()
+    upper = text.upper()
+    if upper in index.by_code:
+        return index.by_code[upper]
+    if text in index.by_name:
+        return index.by_name[text]
+    if upper in index.by_pinyin:
+        return index.by_pinyin[upper]
+    if text in index.city_names:
+        primary = index.primary_station_for_city(text)
+        return index.by_name.get(primary or "")
+    return None
+
+
+def _generic_city_id(airport: AirportRecord) -> str | None:
+    if airport.country == "CN":
+        station_city = station_city_for_airport(airport)
+        if station_city:
+            return f"city:CN:{station_city}"
+    if not airport.city:
+        return None
+    return f"city:{airport.country}:{_normalise_lookup_key(airport.city)}"
+
+
+_CITY_AIRPORT_GROUPS: dict[str, CityAirportGroup] = {
+    "BJS": CityAirportGroup(
+        city_id="city:CN:beijing",
+        query_code="BJS",
+        display_name="北京",
+        english_name="Beijing",
+        country="CN",
+        airport_codes=("PEK", "PKX"),
+        aliases=("北京", "Beijing"),
+    ),
+    "SHA": CityAirportGroup(
+        city_id="city:CN:shanghai",
+        query_code="SHA",
+        display_name="上海",
+        english_name="Shanghai",
+        country="CN",
+        airport_codes=("SHA", "PVG"),
+        aliases=("上海", "Shanghai"),
+    ),
+    "CTU": CityAirportGroup(
+        city_id="city:CN:chengdu",
+        query_code="CTU",
+        display_name="成都",
+        english_name="Chengdu",
+        country="CN",
+        airport_codes=("CTU", "TFU"),
+        aliases=("成都", "Chengdu"),
+    ),
+    "CKG": CityAirportGroup(
+        city_id="city:CN:chongqing",
+        query_code="CKG",
+        display_name="重庆",
+        english_name="Chongqing",
+        country="CN",
+        airport_codes=("CKG",),
+        aliases=("重庆", "Chongqing"),
+    ),
+    "CJU": CityAirportGroup(
+        city_id="city:KR:jeju",
+        query_code="CJU",
+        display_name="济州岛",
+        english_name="Jeju",
+        country="KR",
+        airport_codes=("CJU",),
+        aliases=("济州", "济州岛", "Jeju"),
+    ),
+    "SIN": CityAirportGroup(
+        city_id="city:SG:singapore",
+        query_code="SIN",
+        display_name="新加坡",
+        english_name="Singapore",
+        country="SG",
+        airport_codes=("SIN",),
+        aliases=("新加坡", "Singapore"),
+    ),
+}
+
+_CITY_GROUP_BY_ALIAS: dict[str, CityAirportGroup] = {}
+for _group in _CITY_AIRPORT_GROUPS.values():
+    for _alias in (
+        _group.query_code,
+        _group.display_name,
+        _group.english_name,
+        *_group.aliases,
+    ):
+        _CITY_GROUP_BY_ALIAS[_normalise_lookup_key(_alias)] = _group
+
+
+_TIMEZONE_BY_COUNTRY = {
+    "CN": (8, "Asia/Shanghai"),
+    "HK": (8, "Asia/Hong_Kong"),
+    "MO": (8, "Asia/Macau"),
+    "TW": (8, "Asia/Taipei"),
+    "KR": (9, "Asia/Seoul"),
+    "JP": (9, "Asia/Tokyo"),
+    "SG": (8, "Asia/Singapore"),
+    "TH": (7, "Asia/Bangkok"),
+    "VN": (7, "Asia/Ho_Chi_Minh"),
+    "MY": (8, "Asia/Kuala_Lumpur"),
+}
 
 
 _AIRPORT_QUERY_ALIASES: dict[str, AirportQuery] = {

@@ -318,8 +318,8 @@ def test_parse_ctrip_batch_search_payload_keeps_full_transfer_itinerary():
     )
 
     assert len(evidence) == 1
-    assert evidence[0].departure_time.isoformat() == "2026-07-09T12:40:00+00:00"
-    assert evidence[0].arrival_time.isoformat() == "2026-07-09T22:25:00+00:00"
+    assert evidence[0].departure_time.isoformat() == "2026-07-09T12:40:00+08:00"
+    assert evidence[0].arrival_time.isoformat() == "2026-07-09T22:25:00+08:00"
     assert evidence[0].metadata["flight_no"] == "MU5082+MU5855"
     assert evidence[0].metadata["arrival_airport_code"] == "TFU"
     assert evidence[0].metadata["transfer_count"] == 1

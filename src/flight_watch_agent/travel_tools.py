@@ -15,6 +15,7 @@ from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
 
 from .models import FlightOption, FlightSearchIntent, TrainOption
+from .places import resolve_air_query_place
 
 
 class ToolStatus(str, Enum):
@@ -130,6 +131,19 @@ class FlightSearchRequest:
             raise ValueError("budget_threshold must be positive when supplied.")
         if not self.currency.strip():
             raise ValueError("currency must not be empty.")
+        origin_place = resolve_air_query_place(self.origin)
+        destination_place = resolve_air_query_place(self.destination)
+        if not origin_place.known:
+            raise ValueError(f"Unknown flight origin: {self.origin}")
+        if not destination_place.known:
+            raise ValueError(f"Unknown flight destination: {self.destination}")
+        if (
+            origin_place.city_id
+            and origin_place.city_id == destination_place.city_id
+        ):
+            raise ValueError(
+                "Flight origin and destination must not be in the same city."
+            )
 
     @property
     def request_id(self) -> str:
@@ -638,6 +652,10 @@ def _public_flight_result(result: ToolResult[FlightSearchOutput]) -> dict[str, o
             {
                 "origin": option.origin,
                 "destination": option.destination,
+                "requested_origin": _public_place(option.requested_origin),
+                "requested_destination": _public_place(option.requested_destination),
+                "actual_origin": _public_place(option.actual_origin),
+                "actual_destination": _public_place(option.actual_destination),
                 "travel_date": option.travel_date.isoformat(),
                 "price": option.price,
                 "currency": option.currency,
@@ -657,6 +675,24 @@ def _public_flight_result(result: ToolResult[FlightSearchOutput]) -> dict[str, o
             }
             for option in options
         ],
+    }
+
+
+def _public_place(place) -> dict[str, object] | None:
+    if place is None:
+        return None
+    return {
+        "raw": place.raw,
+        "kind": place.kind,
+        "canonical_id": place.canonical_id,
+        "display_name": place.display_name,
+        "city_id": place.city_id,
+        "city_name": place.city_name,
+        "country": place.country,
+        "query_code": place.query_code,
+        "airport_code": place.airport_code,
+        "airport_codes": list(place.airport_codes),
+        "station_code": place.station_code,
     }
 
 

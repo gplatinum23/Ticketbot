@@ -526,7 +526,10 @@ def parse_ctrip_batch_search_payload(
             intent.destination,
         ):
             continue
-        departure_time = _parse_ctrip_datetime(first_segment.get("departure_time"))
+        departure_time = _parse_ctrip_datetime(
+            first_segment.get("departure_time"),
+            airport_code=first_segment.get("departure_airport_code"),
+        )
         evidence.append(
             FlightEvidence(
                 source_name="flights.ctrip.com",
@@ -534,7 +537,10 @@ def parse_ctrip_batch_search_payload(
                 price=price,
                 currency=intent.currency or "CNY",
                 departure_time=departure_time,
-                arrival_time=_parse_ctrip_datetime(last_segment.get("arrival_time")),
+                arrival_time=_parse_ctrip_datetime(
+                    last_segment.get("arrival_time"),
+                    airport_code=last_segment.get("arrival_airport_code"),
+                ),
                 captured_at=captured_at,
                 origin=intent.origin,
                 destination=intent.destination,
@@ -994,22 +1000,9 @@ def _ctrip_airport_matches_request(observed_code: object, requested_code: str) -
     requested = requested_code.strip().upper()
     if not observed:
         return False
-    if observed == requested:
-        return True
+    from .places import air_endpoint_matches
 
-    from .places import get_airport_index
-
-    airport_index = get_airport_index()
-    observed_airport = airport_index.resolve(observed)
-    requested_airport = airport_index.resolve(requested)
-    if observed_airport is None or requested_airport is None:
-        return False
-    return bool(
-        observed_airport.city
-        and requested_airport.city
-        and observed_airport.country == requested_airport.country
-        and observed_airport.city.casefold() == requested_airport.city.casefold()
-    )
+    return air_endpoint_matches(requested, observed)
 
 
 def _lowest_price(price_list: list[dict[str, Any]]) -> float | None:
@@ -1121,12 +1114,19 @@ def _transfer_count(segments: list[dict[str, Any]], itinerary_segments: list[dic
     return max(len(itinerary_segments) - 1, 0)
 
 
-def _parse_ctrip_datetime(value: str | None) -> datetime | None:
+def _parse_ctrip_datetime(
+    value: str | None,
+    *,
+    airport_code: object = None,
+) -> datetime | None:
     if not value:
         return None
+    from .places import timezone_for_airport
+
+    airport_timezone = timezone_for_airport(str(airport_code or ""))
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
         try:
-            return datetime.strptime(value, fmt).replace(tzinfo=timezone.utc)
+            return datetime.strptime(value, fmt).replace(tzinfo=airport_timezone)
         except ValueError:
             continue
     return None

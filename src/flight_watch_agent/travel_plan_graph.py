@@ -36,12 +36,19 @@ from .flight_react import (
     build_react_flight_search_graph,
     invoke_react_flight_search,
 )
+from .ground_transfers import (
+    GroundTransfer,
+    GroundTransferProvider,
+    StaticGroundTransferProvider,
+    same_physical_endpoint,
+)
 from .models import FlightOption, FlightSearchIntent, SearchResult, TrainOption
 from .places import (
     get_airport_index,
     get_station_index,
     normalise_airport_code,
     normalise_train_query_place,
+    resolve_station_place,
     station_city_for_airport,
 )
 from .progress import ProgressReporter, get_progress_reporter
@@ -287,6 +294,7 @@ def build_travel_plan_graph(
     progress_reporter: ProgressReporter | None = None,
     human_verification_handler=None,
     transfer_hubs: list[str] | None = None,
+    ground_transfer_provider: GroundTransferProvider | None = None,
 ):
     progress = get_progress_reporter(progress_reporter)
     evidence_verifier = verifier or FlightEvidenceVerifier()
@@ -304,6 +312,7 @@ def build_travel_plan_graph(
         )
     if train_tool is None and train_provider is not None:
         train_tool = CachedTrainSearchTool(train_provider)
+    transfer_provider = ground_transfer_provider or StaticGroundTransferProvider()
     graph = StateGraph(TravelPlanState)
 
     def classify_region(state: TravelPlanState) -> TravelPlanState:
@@ -665,13 +674,10 @@ def build_travel_plan_graph(
                 )
             )
 
-        transfer_routes = _build_transfer_routes(
-            trains=state.get("transfer_train_options", []),
-            flights=state.get("transfer_flight_options", []),
+        transfer_routes = _build_two_leg_routes_from_edges(
+            state.get("route_edges", []),
+            ground_transfer_provider=transfer_provider,
         )
-        edge_transfer_routes = _build_two_leg_routes_from_edges(state.get("route_edges", []))
-        if edge_transfer_routes:
-            transfer_routes = edge_transfer_routes
         routes.extend(transfer_routes)
 
         return {**state, "candidate_routes": sorted(routes, key=_route_sort_key)}
@@ -822,24 +828,6 @@ def _summarise_flight_option(option: FlightOption) -> str:
     return (
         f"Flight {flight_no} {option.origin}->{option.destination} "
         f"{option.travel_date.isoformat()}{time_text} {option.price:.2f} {option.currency}"
-    )
-
-
-def _summarise_transfer_route(
-    *,
-    train: TrainOption,
-    flight: FlightOption,
-    total_price: float,
-    wait_minutes: int | None,
-) -> str:
-    train_price = train.lowest_price
-    train_price_text = f"{train_price:.2f}" if train_price is not None else "N/A"
-    wait_text = f"; wait={wait_minutes}min" if wait_minutes is not None else ""
-    flight_text = _summarise_flight_option(flight)
-    return (
-        f"Train+Flight via {train.to_station} total {total_price:.2f} CNY; "
-        f"train {train.train_code} {train.start_time}-{train.arrive_time} {train_price_text} CNY; "
-        f"{flight_text}{wait_text}"
     )
 
 
@@ -1122,8 +1110,8 @@ def _train_edges_from_options(
                 travel_date=option.travel_date,
                 price=option.lowest_price,
                 currency=currency,
-                departure_time=option.start_time,
-                arrival_time=option.arrive_time,
+                departure_time=option.departure_at,
+                arrival_time=option.arrival_at,
                 duration_minutes=_parse_duration_minutes(option.duration),
                 source="12306_mcp",
                 confidence=0.95,
@@ -1164,7 +1152,11 @@ def _flight_edges_from_options(
     return edges
 
 
-def _build_two_leg_routes_from_edges(edges: list[RouteEdge]) -> list[CandidateRoute]:
+def _build_two_leg_routes_from_edges(
+    edges: list[RouteEdge],
+    *,
+    ground_transfer_provider: GroundTransferProvider,
+) -> list[CandidateRoute]:
     first_edges: dict[tuple[str, str], list[RouteEdge]] = {}
     second_edges: dict[tuple[str, str], list[RouteEdge]] = {}
     for edge in edges:
@@ -1186,17 +1178,51 @@ def _build_two_leg_routes_from_edges(edges: list[RouteEdge]) -> list[CandidateRo
                 if second_edge.price is None:
                     continue
                 wait_minutes = _compute_wait_minutes(first_edge.arrival_time, second_edge.departure_time)
-                if (
-                    wait_minutes is not None
-                    and wait_minutes < _minimum_transfer_minutes(strategy)
-                ):
-                    continue
-                total_price = first_edge.price + second_edge.price
-                total_duration_minutes = _two_leg_duration_minutes(
+                ground_transfer = _ground_transfer_between_edges(
                     first_edge,
                     second_edge,
-                    wait_minutes,
+                    ground_transfer_provider,
                 )
+                if ground_transfer is False:
+                    continue
+                transfer_edge = (
+                    _route_edge_from_ground_transfer(
+                        ground_transfer,
+                        strategy=strategy,
+                        hub_id=hub_id,
+                    )
+                    if isinstance(ground_transfer, GroundTransfer)
+                    else None
+                )
+                required_minutes = _minimum_transfer_minutes(strategy)
+                if transfer_edge is not None:
+                    required_minutes = (
+                        transfer_edge.duration_minutes or 0
+                    ) + max(
+                        transfer_edge.buffer_minutes,
+                        _minimum_transfer_minutes(strategy),
+                    )
+                if (
+                    wait_minutes is not None
+                    and wait_minutes < required_minutes
+                ):
+                    continue
+                if wait_minutes is None:
+                    continue
+                total_price = (
+                    first_edge.price
+                    + second_edge.price
+                    + (transfer_edge.price or 0 if transfer_edge is not None else 0)
+                )
+                total_duration_minutes = _route_elapsed_minutes(
+                    first_edge,
+                    second_edge,
+                )
+                route_edges = [
+                    first_edge,
+                    *([transfer_edge] if transfer_edge is not None else []),
+                    second_edge,
+                ]
                 routes.append(
                     CandidateRoute(
                         route_id=f"{strategy}:{hub_id}:{first_edge.edge_id}:{second_edge.edge_id}",
@@ -1208,17 +1234,23 @@ def _build_two_leg_routes_from_edges(edges: list[RouteEdge]) -> list[CandidateRo
                             second_edge=second_edge,
                             total_price=total_price,
                             wait_minutes=wait_minutes,
+                            ground_transfer=ground_transfer if isinstance(ground_transfer, GroundTransfer) else None,
                         ),
                         train_option=_first_train_option(first_edge, second_edge),
                         flight_option=_first_flight_option(first_edge, second_edge),
-                        route_edges=[first_edge, second_edge],
-                        transfer_city=_transfer_city_from_edges(first_edge, second_edge),
+                        route_edges=route_edges,
+                        transfer_city=(
+                            ground_transfer.origin.city_name
+                            if isinstance(ground_transfer, GroundTransfer)
+                            else _transfer_city_from_edges(first_edge, second_edge)
+                        ),
                         transfer_airport=_transfer_airport_from_edges(first_edge, second_edge),
                         transfer_wait_minutes=wait_minutes,
                         total_duration_minutes=total_duration_minutes,
                         segment_count=(
                             _edge_segment_count(first_edge)
                             + _edge_segment_count(second_edge)
+                            + (1 if transfer_edge is not None else 0)
                         ),
                     )
                 )
@@ -1232,12 +1264,21 @@ def _summarise_two_leg_route(
     second_edge: RouteEdge,
     total_price: float,
     wait_minutes: int | None,
+    ground_transfer: GroundTransfer | None = None,
 ) -> str:
     wait_text = f"; wait={wait_minutes}min" if wait_minutes is not None else ""
+    transfer_text = (
+        f"; ground {ground_transfer.origin.display_name}->{ground_transfer.destination.display_name} "
+        f"{ground_transfer.duration_minutes}min+{ground_transfer.buffer_minutes}min buffer "
+        f"{ground_transfer.price:.2f} {ground_transfer.currency} "
+        f"[{ground_transfer.reliability}]"
+        if ground_transfer is not None
+        else ""
+    )
     return (
         f"{_strategy_label(strategy)} via {_transfer_city_from_edges(first_edge, second_edge) or first_edge.destination} "
         f"total {total_price:.2f} {first_edge.currency}; "
-        f"{_edge_summary(first_edge)}; {_edge_summary(second_edge)}{wait_text}"
+        f"{_edge_summary(first_edge)}{transfer_text}; {_edge_summary(second_edge)}{wait_text}"
     )
 
 
@@ -1259,7 +1300,116 @@ def _edge_summary(edge: RouteEdge) -> str:
         metadata = edge.raw_option.evidence[0].metadata or {} if edge.raw_option.evidence else {}
         flight_no = metadata.get("flight_no") or "unknown flight"
         return f"flight {flight_no} {edge.origin}->{edge.destination}{time_text} {price_text}"
+    if edge.mode == "local_transfer" and isinstance(edge.raw_option, GroundTransfer):
+        transfer = edge.raw_option
+        return (
+            f"ground {transfer.origin.display_name}->{transfer.destination.display_name}"
+            f"{time_text} {transfer.duration_minutes}min"
+            f"+{transfer.buffer_minutes}min buffer {price_text}"
+            f" [{transfer.reliability}; {transfer.source}]"
+        )
     return f"{edge.mode} {edge.origin}->{edge.destination}{time_text} {price_text}"
+
+
+def _ground_transfer_between_edges(
+    first_edge: RouteEdge,
+    second_edge: RouteEdge,
+    provider: GroundTransferProvider,
+) -> GroundTransfer | None | bool:
+    if first_edge.arrival_time is None or second_edge.departure_time is None:
+        return False
+    origin = _edge_endpoint_place(first_edge, arrival=True)
+    destination = _edge_endpoint_place(second_edge, arrival=False)
+    if (
+        same_physical_endpoint(origin, destination)
+        and not (first_edge.mode == "flight" and second_edge.mode == "flight")
+    ):
+        return None
+    transfer = provider.find(
+        origin,
+        destination,
+        departure_at=first_edge.arrival_time,
+        currency=first_edge.currency,
+        origin_terminal=_edge_terminal(first_edge, arrival=True),
+        destination_terminal=_edge_terminal(second_edge, arrival=False),
+    )
+    if transfer is not None:
+        return transfer
+    if same_physical_endpoint(origin, destination):
+        return None
+    return False
+
+
+def _edge_endpoint_place(edge: RouteEdge, *, arrival: bool):
+    if isinstance(edge.raw_option, FlightOption):
+        place = (
+            edge.raw_option.actual_destination
+            if arrival
+            else edge.raw_option.actual_origin
+        )
+        if place is not None:
+            return place
+    if isinstance(edge.raw_option, TrainOption):
+        station_code = (
+            edge.raw_option.to_station_code
+            if arrival
+            else edge.raw_option.from_station_code
+        )
+        station_place = resolve_station_place(
+            station_code
+            or (
+                edge.raw_option.to_station
+                if arrival
+                else edge.raw_option.from_station
+            )
+        )
+        if station_place is not None:
+            return station_place
+    value = edge.destination if arrival else edge.origin
+    return value
+
+
+def _edge_terminal(edge: RouteEdge, *, arrival: bool) -> str | None:
+    if not isinstance(edge.raw_option, FlightOption):
+        return None
+    for evidence in edge.raw_option.evidence:
+        metadata = evidence.metadata or {}
+        key = "arrival_terminal" if arrival else "departure_terminal"
+        value = str(metadata.get(key) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _route_edge_from_ground_transfer(
+    transfer: GroundTransfer,
+    *,
+    strategy: str,
+    hub_id: str,
+) -> RouteEdge:
+    return RouteEdge(
+        edge_id=(
+            f"ground:{transfer.origin.canonical_id}:"
+            f"{transfer.destination.canonical_id}:{transfer.source}"
+        ),
+        mode="local_transfer",
+        strategy=strategy,
+        origin=transfer.origin.canonical_id,
+        destination=transfer.destination.canonical_id,
+        travel_date=transfer.departure_at.date(),
+        price=transfer.price,
+        currency=transfer.currency,
+        departure_time=transfer.departure_at,
+        arrival_time=transfer.arrival_at,
+        duration_minutes=transfer.duration_minutes,
+        buffer_minutes=transfer.buffer_minutes,
+        source=transfer.source,
+        reliability=transfer.reliability,
+        confidence=0.85 if transfer.reliability == "curated_estimate" else 0.6,
+        hub_id=hub_id,
+        leg_index=1,
+        raw_option=transfer,
+    )
 
 
 def _edge_time_text(edge: RouteEdge) -> str:
@@ -1298,12 +1448,12 @@ def _day_offset_suffix(day_offset: int) -> str:
     return f"({sign}{day_offset}d)"
 
 
-def _format_time_value(value: datetime | str | None) -> str:
+def _format_time_value(value: datetime | None) -> str:
     if value is None:
         return ""
     if isinstance(value, datetime):
         return value.strftime("%H:%M")
-    return str(value)
+    return value.strftime("%H:%M")
 
 
 def _first_train_option(first_edge: RouteEdge, second_edge: RouteEdge) -> TrainOption | None:
@@ -1336,57 +1486,6 @@ def _transfer_airport_from_edges(first_edge: RouteEdge, second_edge: RouteEdge) 
     if second_edge.mode == "flight":
         return second_edge.origin
     return None
-
-
-def _build_transfer_routes(
-    *,
-    trains: list[TrainOption],
-    flights: list[FlightOption],
-) -> list[CandidateRoute]:
-    flights_by_origin: dict[str, list[FlightOption]] = {}
-    for flight in flights:
-        flights_by_origin.setdefault(flight.origin, []).append(flight)
-
-    routes: list[CandidateRoute] = []
-    for train in trains:
-        hub_code = normalise_airport_code(train.to_station)
-        if not hub_code:
-            continue
-        for flight in flights_by_origin.get(hub_code, []):
-            if train.lowest_price is None:
-                continue
-            wait_minutes = _compute_transfer_wait_minutes(train.arrive_time, flight.departure_time)
-            if wait_minutes is not None and wait_minutes < _minimum_transfer_minutes("train_flight"):
-                continue
-            total_price = train.lowest_price + flight.price
-            routes.append(
-                CandidateRoute(
-                    route_id=(
-                        f"train-flight:{train.train_code}:{train.to_station}:"
-                        f"{flight.origin}:{flight.destination}:{flight.price}"
-                    ),
-                    route_type="train_flight",
-                    total_price=total_price,
-                    summary=_summarise_transfer_route(
-                        train=train,
-                        flight=flight,
-                        total_price=total_price,
-                        wait_minutes=wait_minutes,
-                    ),
-                    train_option=train,
-                    flight_option=flight,
-                    transfer_city=train.to_station,
-                    transfer_airport=hub_code,
-                    transfer_wait_minutes=wait_minutes,
-                    total_duration_minutes=_sum_known_minutes(
-                        _parse_duration_minutes(train.duration),
-                        wait_minutes,
-                        _flight_duration_minutes(flight),
-                    ),
-                    segment_count=1 + _flight_segment_count(flight),
-                )
-            )
-    return sorted(routes, key=_route_sort_key)[:12]
 
 
 def _route_sort_key(route: CandidateRoute) -> tuple[int, float]:
@@ -1443,14 +1542,22 @@ def _edge_segment_count(edge: RouteEdge) -> int:
     return 1
 
 
-def _two_leg_duration_minutes(
+def _route_elapsed_minutes(
     first_edge: RouteEdge,
     second_edge: RouteEdge,
-    wait_minutes: int | None,
 ) -> int | None:
+    if first_edge.departure_time is not None and second_edge.arrival_time is not None:
+        return max(
+            0,
+            int(
+                (
+                    second_edge.arrival_time - first_edge.departure_time
+                ).total_seconds()
+                // 60
+            ),
+        )
     return _sum_known_minutes(
         first_edge.duration_minutes,
-        wait_minutes,
         second_edge.duration_minutes,
     )
 
@@ -1505,41 +1612,13 @@ def _enforce_dominance_order(routes: list[CandidateRoute]) -> list[CandidateRout
     return ordered
 
 
-def _compute_transfer_wait_minutes(train_arrive: str, flight_departure: datetime | None) -> int | None:
-    if flight_departure is None:
-        return None
-    try:
-        train_hour, train_minute = train_arrive.split(":")
-        train_minutes = int(train_hour) * 60 + int(train_minute)
-    except (TypeError, ValueError):
-        return None
-    departure_minutes = flight_departure.hour * 60 + flight_departure.minute
-    return departure_minutes - train_minutes
-
-
 def _compute_wait_minutes(
-    first_arrival: datetime | str | None,
-    second_departure: datetime | str | None,
+    first_arrival: datetime | None,
+    second_departure: datetime | None,
 ) -> int | None:
     if isinstance(first_arrival, datetime) and isinstance(second_departure, datetime):
         return int((second_departure - first_arrival).total_seconds() // 60)
-    first_minutes = _minutes_since_midnight(first_arrival)
-    second_minutes = _minutes_since_midnight(second_departure)
-    if first_minutes is None or second_minutes is None:
-        return None
-    return second_minutes - first_minutes
-
-
-def _minutes_since_midnight(value: datetime | str | None) -> int | None:
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return value.hour * 60 + value.minute
-    try:
-        hour, minute = value.split(":")[:2]
-        return int(hour) * 60 + int(minute)
-    except (AttributeError, ValueError):
-        return None
+    return None
 
 
 def _dedupe_hubs(hubs: list[str]) -> list[str]:

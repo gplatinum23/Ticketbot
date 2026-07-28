@@ -23,6 +23,11 @@ from .models import (
     FlightSearchIntent,
     SearchResult,
 )
+from .places import (
+    air_endpoint_matches,
+    query_endpoint_matches,
+    resolve_actual_airport,
+)
 from .progress import ProgressReporter, get_progress_reporter
 
 
@@ -322,10 +327,14 @@ class FlightEvidenceVerifier:
 
         grouped: dict[tuple[str, str, date], list[FlightEvidence]] = defaultdict(list)
         for item in valid_evidence:
+            actual_origin = _evidence_airport_code(item, departure=True)
+            actual_destination = _evidence_airport_code(item, departure=False)
             grouped[
                 (
-                    _normalise_place(item.origin or intent.origin),
-                    _normalise_place(item.destination or intent.destination),
+                    _normalise_place(actual_origin or item.origin or intent.origin),
+                    _normalise_place(
+                        actual_destination or item.destination or intent.destination
+                    ),
                     item.travel_date or intent.travel_date,
                 )
             ].append(item)
@@ -356,6 +365,10 @@ class FlightEvidenceVerifier:
                     evidence=sorted_items,
                     reliability=reliability,
                     warnings=warnings,
+                    requested_origin=intent.origin_place,
+                    requested_destination=intent.destination_place,
+                    actual_origin=resolve_actual_airport(origin),
+                    actual_destination=resolve_actual_airport(destination),
                 )
             )
 
@@ -1332,11 +1345,41 @@ def _matches_intent_without_time_preference(item: FlightEvidence, intent: Flight
         return False
     if item.travel_date is not None and item.travel_date != intent.travel_date:
         return False
-    if item.origin is not None and _normalise_place(item.origin) != _normalise_place(intent.origin):
+    actual_origin = _evidence_airport_code(item, departure=True)
+    actual_destination = _evidence_airport_code(item, departure=False)
+    observed_origin = actual_origin or item.origin
+    observed_destination = actual_destination or item.destination
+    origin_matches = (
+        True
+        if observed_origin is None
+        else air_endpoint_matches(intent.origin_place, observed_origin)
+        if actual_origin is not None
+        else query_endpoint_matches(intent.origin_place, observed_origin)
+    )
+    destination_matches = (
+        True
+        if observed_destination is None
+        else air_endpoint_matches(intent.destination_place, observed_destination)
+        if actual_destination is not None
+        else query_endpoint_matches(intent.destination_place, observed_destination)
+    )
+    if observed_origin is not None and not origin_matches:
         return False
-    if item.destination is not None and _normalise_place(item.destination) != _normalise_place(intent.destination):
+    if observed_destination is not None and not destination_matches:
         return False
     return True
+
+
+def _evidence_airport_code(
+    item: FlightEvidence,
+    *,
+    departure: bool,
+) -> str | None:
+    metadata = item.metadata or {}
+    key = "departure_airport_code" if departure else "arrival_airport_code"
+    value = metadata.get(key)
+    text = str(value or "").strip().upper()
+    return text or None
 
 
 def _matches_time_preference(item: FlightEvidence, time_preference: str | None) -> bool:

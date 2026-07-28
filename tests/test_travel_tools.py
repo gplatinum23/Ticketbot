@@ -193,6 +193,12 @@ def test_tool_requests_validate_invalid_inputs():
     with pytest.raises(ValueError, match="positive"):
         TrainSearchRequest("成都东", "重庆北", date(2026, 7, 31), max_results=0)
 
+    with pytest.raises(ValueError, match="Unknown flight origin"):
+        FlightSearchRequest("ZZZ", "CJU", date(2026, 7, 31))
+
+    with pytest.raises(ValueError, match="same city"):
+        FlightSearchRequest("PEK", "PKX", date(2026, 7, 31))
+
 
 def test_langchain_adapters_expose_stable_names_and_public_payloads():
     train_tool = as_langchain_train_tool(
@@ -242,6 +248,8 @@ def test_langchain_adapters_expose_stable_names_and_public_payloads():
     assert flight_tool.name == "search_flights"
     assert flight_payload["status"] == "success"
     assert flight_payload["options"][0]["destination"] == "CJU"
+    assert flight_payload["options"][0]["actual_origin"]["airport_code"] == "CTU"
+    assert flight_payload["options"][0]["actual_origin"]["raw"] == "CTU"
     assert "private_browser_state" not in flight_payload
 
 

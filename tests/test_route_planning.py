@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import threading
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from flight_watch_agent.models import FlightEvidence, FlightOption, FlightSearchIntent, SearchResult, TrainOption
 from flight_watch_agent.travel_plan_graph import (
@@ -18,6 +18,9 @@ from flight_watch_agent.travel_plan_graph import (
     _summarise_flight_option,
     build_travel_plan_graph,
 )
+
+
+CHINA_LOCAL_TIME = timezone(timedelta(hours=8), "Asia/Shanghai")
 
 
 class HubTrainProvider:
@@ -144,8 +147,8 @@ class HubExtractor:
                 url=url,
                 price=900.0,
                 currency="CNY",
-                departure_time=datetime(2026, 7, 10, 11, 40, tzinfo=timezone.utc),
-                arrival_time=datetime(2026, 7, 10, 16, 30, tzinfo=timezone.utc),
+                departure_time=datetime(2026, 7, 10, 11, 40, tzinfo=CHINA_LOCAL_TIME),
+                arrival_time=datetime(2026, 7, 10, 16, 30, tzinfo=CHINA_LOCAL_TIME),
                 captured_at=datetime(2026, 7, 9, 9, 0, tzinfo=timezone.utc),
                 origin="SHA",
                 destination="SIN",
@@ -160,8 +163,8 @@ class MultiStrategyTrainProvider:
         pairs = {
             ("CTU", "广通北"): ("K100", "Chengdu", "Guangtongbei", "07:00", "11:00", 120.0),
             ("广通北", "DLU"): ("D200", "Guangtongbei", "Dali", "12:10", "15:00", 80.0),
-            ("昆明", "DLU"): ("D8701", "Kunming", "Dali", "14:20", "16:30", 145.0),
-            ("昆明南", "DLU"): ("D8703", "Kunming South", "Dali", "14:30", "16:40", 150.0),
+            ("昆明", "DLU"): ("D8701", "Kunming", "Dali", "16:00", "18:10", 145.0),
+            ("昆明南", "DLU"): ("D8703", "Kunming South", "Dali", "16:10", "18:20", 150.0),
         }
         key = (intent.origin, intent.destination)
         if key not in pairs:
@@ -241,8 +244,8 @@ class MultiStrategyExtractor:
                 url=url,
                 price=price,
                 currency="CNY",
-                departure_time=datetime(2026, 7, 10, dh, dm, tzinfo=timezone.utc),
-                arrival_time=datetime(2026, 7, 10, ah, am, tzinfo=timezone.utc),
+                departure_time=datetime(2026, 7, 10, dh, dm, tzinfo=CHINA_LOCAL_TIME),
+                arrival_time=datetime(2026, 7, 10, ah, am, tzinfo=CHINA_LOCAL_TIME),
                 captured_at=datetime(2026, 7, 9, 9, 0, tzinfo=timezone.utc),
                 origin=origin,
                 destination=destination,
@@ -342,7 +345,8 @@ def test_travel_plan_graph_builds_train_flight_transfer_route():
 
     transfer_routes = [route for route in state["candidate_routes"] if route.route_type == "train_flight"]
     assert len(transfer_routes) == 1
-    assert transfer_routes[0].total_price == 1080.0
+    assert transfer_routes[0].total_price == 1160.0
+    assert transfer_routes[0].route_edges[1].mode == "local_transfer"
     assert "Train+Flight via Shanghai" in transfer_routes[0].summary
 
 
@@ -392,7 +396,8 @@ def test_travel_plan_graph_builds_flight_train_route():
 
     flight_train_routes = [route for route in state["candidate_routes"] if route.route_type == "flight_train"]
     assert len(flight_train_routes) == 1
-    assert flight_train_routes[0].total_price == 745.0
+    assert flight_train_routes[0].total_price == 825.0
+    assert flight_train_routes[0].route_edges[1].mode == "local_transfer"
     assert "Flight+Train via Kunming" in flight_train_routes[0].summary
 
 

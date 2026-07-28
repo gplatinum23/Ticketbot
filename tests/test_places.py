@@ -4,8 +4,14 @@ from flight_watch_agent.places import (
     AirportQuery,
     get_airport_index,
     get_station_index,
+    air_endpoint_matches,
     normalise_airport_code,
     normalise_train_query_place,
+    query_endpoint_matches,
+    resolve_actual_airport,
+    resolve_air_query_place,
+    resolve_place,
+    resolve_station_place,
 )
 
 
@@ -55,3 +61,49 @@ def test_train_place_normalisation_uses_station_and_airport_tables_separately():
     assert normalise_train_query_place("TFU") == "成都"
     assert normalise_train_query_place("SIN") is None
     assert normalise_train_query_place("新加坡") is None
+
+
+def test_city_airport_and_station_identifiers_have_distinct_boundaries():
+    beijing = resolve_air_query_place("BJS")
+    capital = resolve_actual_airport("PEK")
+    daxing = resolve_actual_airport("PKX")
+    beijing_west = resolve_place("北京西")
+
+    assert beijing.kind == "city"
+    assert beijing.canonical_id == "city:CN:beijing"
+    assert beijing.airport_codes == ("PEK", "PKX")
+    assert capital is not None and capital.canonical_id == "airport:PEK"
+    assert daxing is not None and daxing.canonical_id == "airport:PKX"
+    assert beijing_west.kind == "station"
+    assert beijing_west.canonical_id == "station:BXP"
+    assert len({beijing.canonical_id, capital.canonical_id, daxing.canonical_id, beijing_west.canonical_id}) == 4
+
+
+def test_city_query_accepts_member_airports_but_explicit_airport_is_exact():
+    assert air_endpoint_matches("BJS", "PEK")
+    assert air_endpoint_matches("BJS", "PKX")
+    assert air_endpoint_matches("北京", "PEK")
+    assert air_endpoint_matches("PEK", "PEK")
+    assert not air_endpoint_matches("PEK", "PKX")
+    assert not air_endpoint_matches("BJS", "CKG")
+    assert query_endpoint_matches("BJS", "北京")
+
+
+def test_unknown_airport_code_is_not_silently_treated_as_valid_airport():
+    unknown = resolve_air_query_place("ZZZ")
+
+    assert unknown.kind == "unknown"
+    assert not unknown.known
+    assert normalise_airport_code("ZZZ") is None
+
+
+def test_station_telecode_and_iata_collision_requires_explicit_context():
+    shanghai_station = resolve_station_place("SHH")
+    shishmaref_airport = resolve_actual_airport("SHH")
+
+    assert shanghai_station is not None
+    assert shanghai_station.kind == "station"
+    assert shanghai_station.canonical_id == "station:SHH"
+    assert shishmaref_airport is not None
+    assert shishmaref_airport.kind == "airport"
+    assert shishmaref_airport.canonical_id == "airport:SHH"
