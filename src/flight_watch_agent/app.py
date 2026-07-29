@@ -18,7 +18,8 @@ from .travel_plan_graph import LlmHubPlanner
 from .travel_plan_graph import LlmRoutePlanner
 from .travel_tools import (
     CachedTrainSearchTool,
-    InMemoryToolCache,
+    SqliteToolCache,
+    ToolCache,
     ToolCachePolicy,
     as_langchain_flight_tool,
     as_langchain_train_tool,
@@ -115,7 +116,7 @@ def build_default_flight_query_tool(
     action_planner=None,
     progress_reporter: ProgressReporter | None = None,
     human_verification_handler=None,
-    cache: InMemoryToolCache | None = None,
+    cache: ToolCache | None = None,
 ):
     return build_react_flight_search_tool(
         web_search=build_default_flight_web_search_tool(),
@@ -133,6 +134,11 @@ def build_default_train_query_tool():
         Mcp12306TrainProvider(),
         cache=_build_tool_cache(),
     )
+
+
+def clear_default_tool_cache() -> None:
+    """Clear the configured persistent tool cache without starting a backend."""
+    _build_tool_cache().clear()
 
 
 def build_default_agent_tools(*, include_train: bool = True):
@@ -181,21 +187,24 @@ def _config_list(name: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
-def _build_tool_cache() -> InMemoryToolCache:
-    return InMemoryToolCache(
-        ToolCachePolicy(
-            ttl_seconds=int(
-                get_config("FLIGHT_WATCH_TOOL_CACHE_TTL_SECONDS", "300") or "300"
-            ),
-            max_entries=int(
-                get_config("FLIGHT_WATCH_TOOL_CACHE_MAX_ENTRIES", "512") or "512"
-            ),
-            cache_no_results=_config_bool(
-                "FLIGHT_WATCH_TOOL_CACHE_NO_RESULTS",
-                default=True,
-            ),
-        )
+def _build_tool_cache() -> ToolCache:
+    policy = ToolCachePolicy(
+        ttl_seconds=int(
+            get_config("FLIGHT_WATCH_TOOL_CACHE_TTL_SECONDS", "300") or "300"
+        ),
+        no_result_ttl_seconds=int(
+            get_config("FLIGHT_WATCH_TOOL_CACHE_NO_RESULT_TTL_SECONDS", "60") or "60"
+        ),
+        max_entries=int(
+            get_config("FLIGHT_WATCH_TOOL_CACHE_MAX_ENTRIES", "512") or "512"
+        ),
+        cache_no_results=_config_bool(
+            "FLIGHT_WATCH_TOOL_CACHE_NO_RESULTS",
+            default=True,
+        ),
     )
+    path = get_config("FLIGHT_WATCH_TOOL_CACHE_PATH", "data/tool_cache.sqlite3")
+    return SqliteToolCache(path or "data/tool_cache.sqlite3", policy)
 
 
 def _build_fast_llm(default_llm):

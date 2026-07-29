@@ -107,7 +107,7 @@ FLIGHT_WATCH_CTRIP_REUSE_BROWSER=true
 - `FlightSearchTool`：接收 `FlightSearchRequest`，返回 `ToolResult[FlightSearchOutput]`。
 - `TrainSearchTool`：接收 `TrainSearchRequest`，返回 `ToolResult[TrainSearchOutput]`。
 
-工具提供单次 `search()` 和批量 `search_many()` 接口。批量接口保持输入顺序、自动消除重复请求，并复用线程安全的 TTL/LRU 内存缓存。默认缓存 300 秒、最多 512 条；错误和需要人工操作的结果不会缓存。
+工具提供单次 `search()` 和批量 `search_many()` 接口。批量接口保持输入顺序、自动消除重复请求，并复用线程安全的 L1 内存缓存与 SQLite L2 持久缓存。成功结果默认缓存 300 秒、空结果默认缓存 60 秒；错误、验证码、登录和取消结果不会缓存。
 
 ```python
 from datetime import date
@@ -133,15 +133,23 @@ elif result.error:
 
 ```text
 invalid_input, timeout, captcha_required, login_required, rate_limited,
-route_mismatch, parse_failed, tool_unavailable, internal_error
+route_mismatch, parse_failed, tool_unavailable, cancelled, internal_error
 ```
 
-每个结果同时返回 `request_id`、耗时、缓存命中、尝试次数和后端名称。可通过以下配置调整缓存：
+每个结果同时返回 `request_id`、耗时、缓存命中、尝试次数、终止原因、退避记录和后端名称。可通过以下配置调整缓存：
 
 ```dotenv
 FLIGHT_WATCH_TOOL_CACHE_TTL_SECONDS=300
+FLIGHT_WATCH_TOOL_CACHE_NO_RESULT_TTL_SECONDS=60
 FLIGHT_WATCH_TOOL_CACHE_MAX_ENTRIES=512
 FLIGHT_WATCH_TOOL_CACHE_NO_RESULTS=true
+FLIGHT_WATCH_TOOL_CACHE_PATH=data/tool_cache.sqlite3
+```
+
+缓存键包含工具名、规范化请求、后端版本、解析版本、输出 schema 版本和 scope。机票缓存只保存结构化领域结果和脱敏证据，绝不保存浏览器 `raw_state`、Cookie、Token 或 URL 查询参数。需要手动清理时：
+
+```powershell
+.\agent_env\Scripts\flight-watch.exe clear-cache
 ```
 
 需要注册给 LangChain Agent 时，可直接使用：
@@ -155,6 +163,16 @@ tools = build_default_agent_tools()
 
 Agent 适配器只返回精简、可序列化的公开字段，不暴露浏览器状态或原始抓包。
 
+### 工具执行 Runtime
+
+`search()` 与 `search_many()` 可选接收 `ToolExecutionContext`，用于提供共享的绝对 deadline、取消信号、追踪标识和幂等键；旧调用方式保持兼容。`ToolRuntime` 是火车和机票工具唯一的重试边界：只会对 `timeout`、`rate_limited`、`tool_unavailable` 执行有限指数退避重试，其余错误（包括验证码、登录和解析失败）立即返回。同步后端调用无法被强行中断，但 deadline 或取消一旦被观察到，Runtime 不会再启动未开始的子请求或重试，并保留已经完成的批次结果。
+
+### 携程工具组件边界
+
+携程查询由 `CtripFlightBackend` 编排：`CtripNavigator` 负责入口导航，`BrowserSessionManager` 管理浏览器生命周期和登录会话，`CtripCaptureBackend` 只抓取 `batchSearch` 原始响应，`CtripPayloadParser` 纯解析 payload，`FlightEvidenceMapper` 转换为领域证据。`CtripSeleniumWirePageExtractor` 仅保留为旧 `PageExtractor` 协议的兼容适配器。
+
+原始响应通过 `RawResponseStore` 生成脱敏引用；工具、规划图和 LangChain 适配器不会取得浏览器请求或 Cookie。当前内存存储用于本进程追踪，持久录制/回放和 SQLite 缓存将在后续 P1 阶段完成。
+
 ### 路线正确性边界
 
 - 查询地点会保留原始输入，并分别解析为城市、实际机场或火车站。城市代码（如 `BJS`）可以匹配 `PEK/PKX`，明确指定 `PEK` 时不会接受 `PKX` 证据。
@@ -164,6 +182,8 @@ Agent 适配器只返回精简、可序列化的公开字段，不暴露浏览�
 - 当前地面接驳数据是保守的内置估算，最终下单前仍应核验实时交通情况。
 - 候选路线在评分和排序前统一经过确定性可行性引擎。引擎校验实际端点连通、带时区的绝对时间顺序、地面接驳以及国内/国际、同机场/跨机场、火车转飞机等不同换乘缓冲。
 - 可行性结果分为 `feasible`、`infeasible` 和 `uncertain`，并附带结构化原因及可用/必需换乘分钟数。`infeasible` 不进入 Top 5；`uncertain` 会在推荐文本中标出风险代码。
+- 排序完成后会按交通方式、实际端点、核心班次和换乘 Hub 生成路线骨架，移除完全重复骨架，并限制同一后半程航班的轻微火车变体最多占两个推荐名额。
+- 最终候选通过确定性多样性选择覆盖 `best_overall`、`lowest_price`、`shortest_duration`、`lower_transfer_risk` 和 `shortest_wait` 等价值取向；可用的差异化路线不足 5 条时会明确说明实际数量。
 
 ## 使用
 
@@ -216,6 +236,14 @@ Agent 适配器只返回精简、可序列化的公开字段，不暴露浏览�
 ```powershell
 .\agent_env\Scripts\python.exe -m pytest -q
 ```
+
+已完成的 P1.0–P1.2 可使用独立门槛验证：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify_p1_foundation.ps1
+```
+
+该命令验证工具契约、携程组件边界、Runtime 重试/取消/部分成功、SQLite 持久缓存和公开 LangChain 输出；它不会访问真实 12306 或携程。并发治理、脱敏回放和工具注册属于后续补充性能与稳定性计划。
 
 ## 当前限制
 

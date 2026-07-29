@@ -10,6 +10,7 @@ from .app import (
     build_default_flight_search_agent,
     build_default_request_agent,
     build_default_travel_plan_agent,
+    clear_default_tool_cache,
 )
 from .models import FlightSearchIntent
 from .flight_react import invoke_react_flight_search
@@ -43,8 +44,17 @@ def main(argv: list[str] | None = None) -> None:
     _add_flight_intent_arguments(debug_parser)
     debug_parser.add_argument("--max-iterations", type=int, default=4)
     debug_parser.add_argument("--no-llm-judge", action="store_true", help="Skip LLM evidence judging.")
+    subparsers.add_parser(
+        "clear-cache",
+        help="Clear the configured persistent tool cache without querying a backend.",
+    )
 
     args = parser.parse_args(argv)
+    if args.command == "clear-cache":
+        clear_default_tool_cache()
+        print("Tool cache cleared.")
+        return
+
     if args.command == "ask":
         graph = build_default_request_agent(
             llm_model=args.model,

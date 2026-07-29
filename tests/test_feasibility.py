@@ -341,6 +341,8 @@ def test_graph_keeps_uncertain_route_and_renders_risk_reason():
     )
     assert "feasibility=uncertain" in state["response"]
     assert "missing_departure_time" in state["response"]
+    assert "value=best_overall,lowest_price,lower_transfer_risk" in state["response"]
+    assert "Only 1 sufficiently distinct usable routes" in state["response"]
 
 
 def _train_option() -> TrainOption:

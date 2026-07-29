@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import json
 import os
 import atexit
 import threading
 import time
 import urllib.parse
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, Sequence
 
 from .models import FlightEvidence, FlightPageAttemptResult, FlightSearchIntent, SearchResult
 
@@ -39,238 +42,514 @@ class CtripRouteSearchTool:
         ]
 
 
-class CtripSeleniumWirePageExtractor:
+@dataclass(frozen=True)
+class RawResponseRef:
+    capture_id: str
+    source_url: str
+    captured_at: datetime
+    parser_version: str
+
+
+@dataclass(frozen=True)
+class CapturedCtripResponse:
+    payload: dict[str, Any]
+    source_url: str
+    captured_at: datetime
+    response_ref: RawResponseRef
+
+
+@dataclass(frozen=True)
+class ParsedCtripItinerary:
+    itinerary_id: str | None
+    segments: tuple[dict[str, object], ...]
+    transfer_count: int
+    price: float
+
+
+class RawResponseStore(Protocol):
+    def store(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        source_url: str,
+        captured_at: datetime,
+        parser_version: str,
+    ) -> RawResponseRef:
+        """Store a redacted capture and return its stable reference."""
+
+
+class CtripNavigatorProtocol(Protocol):
+    def search_urls(self, intent: FlightSearchIntent) -> list[str]:
+        """Return supported direct Ctrip search URLs in preference order."""
+
+    def navigate(
+        self,
+        driver: object,
+        intent: FlightSearchIntent,
+        *,
+        entrypoint: str,
+        force_refresh: bool = False,
+    ) -> str:
+        """Navigate a browser to one Ctrip entrypoint and return its source URL."""
+
+
+class BrowserSessionManagerProtocol(Protocol):
+    def acquire(self) -> tuple[object, bool]:
+        """Borrow a browser and indicate whether it was newly created."""
+
+    def prepare(self, driver: object, *, is_new: bool) -> None:
+        """Prepare a borrowed browser session for a query."""
+
+    def release(self, driver: object) -> None:
+        """Return or dispose a borrowed browser."""
+
+    def close(self) -> None:
+        """Dispose all managed browser resources."""
+
+
+class CtripCaptureBackendProtocol(Protocol):
+    def clear(self, driver: object) -> None:
+        """Clear captured browser requests before navigation."""
+
+    def capture(
+        self,
+        driver: object,
+        *,
+        source_url: str,
+        timeout_seconds: int,
+        manual_verification_wait_seconds: int,
+    ) -> CapturedCtripResponse:
+        """Capture one raw batchSearch response without parsing it."""
+
+
+class InMemoryRawResponseStore:
+    """Redacted in-process response store used until P1.5 adds durable recording."""
+
+    _SENSITIVE_FIELD_MARKERS = (
+        "cookie",
+        "token",
+        "password",
+        "phone",
+        "mobile",
+        "identity",
+        "passport",
+        "order",
+    )
+
+    def __init__(self) -> None:
+        self._records: dict[str, dict[str, Any]] = {}
+        self._lock = threading.RLock()
+
+    def store(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        source_url: str,
+        captured_at: datetime,
+        parser_version: str,
+    ) -> RawResponseRef:
+        redacted = _redact_capture_value(dict(payload), self._SENSITIVE_FIELD_MARKERS)
+        encoded = json.dumps(redacted, ensure_ascii=False, sort_keys=True, default=str)
+        capture_id = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        reference = RawResponseRef(
+            capture_id=capture_id,
+            source_url=source_url,
+            captured_at=captured_at,
+            parser_version=parser_version,
+        )
+        with self._lock:
+            self._records[capture_id] = redacted
+        return reference
+
+    def get(self, reference: RawResponseRef) -> dict[str, Any] | None:
+        with self._lock:
+            record = self._records.get(reference.capture_id)
+            return json.loads(json.dumps(record)) if record is not None else None
+
+
+class CtripPayloadParser:
+    """Pure batchSearch payload parser: no browser, environment or network access."""
+
+    version = "ctrip-payload-v1"
+
+    def parse(self, payload: Mapping[str, Any]) -> list[ParsedCtripItinerary]:
+        raw_data = payload.get("data")
+        data = raw_data if isinstance(raw_data, Mapping) else {}
+        raw_itineraries = data.get("flightItineraryList")
+        if not isinstance(raw_itineraries, list):
+            return []
+        parsed: list[ParsedCtripItinerary] = []
+        for raw_itinerary in raw_itineraries:
+            if not isinstance(raw_itinerary, dict):
+                continue
+            raw_segments = raw_itinerary.get("flightSegments")
+            segments = raw_segments if isinstance(raw_segments, list) else []
+            itinerary_segments = _itinerary_segments(segments)
+            if not itinerary_segments:
+                continue
+            raw_price_list = raw_itinerary.get("priceList")
+            price = _lowest_price(raw_price_list if isinstance(raw_price_list, list) else [])
+            if price is None:
+                continue
+            parsed.append(
+                ParsedCtripItinerary(
+                    itinerary_id=str(raw_itinerary.get("itineraryId") or "") or None,
+                    segments=tuple(itinerary_segments),
+                    transfer_count=_transfer_count(segments, itinerary_segments),
+                    price=price,
+                )
+            )
+        return parsed
+
+
+class FlightEvidenceMapper:
+    """Maps parsed Ctrip itineraries to domain evidence without browser access."""
+
+    def map(
+        self,
+        itineraries: Sequence[ParsedCtripItinerary],
+        intent: FlightSearchIntent,
+        *,
+        source_url: str,
+        captured_at: datetime,
+        direct_only: bool,
+        max_results: int,
+        response_ref: RawResponseRef | None = None,
+    ) -> list[FlightEvidence]:
+        evidence: list[FlightEvidence] = []
+        for itinerary in itineraries:
+            if direct_only and itinerary.transfer_count != 0:
+                continue
+            first_segment = itinerary.segments[0]
+            last_segment = itinerary.segments[-1]
+            if not _ctrip_airport_matches_request(
+                first_segment.get("departure_airport_code"), intent.origin
+            ):
+                continue
+            if not _ctrip_airport_matches_request(
+                last_segment.get("arrival_airport_code"), intent.destination
+            ):
+                continue
+            departure_time = _parse_ctrip_datetime(
+                first_segment.get("departure_time"),
+                airport_code=first_segment.get("departure_airport_code"),
+            )
+            metadata = _flight_metadata(
+                itinerary_segments=list(itinerary.segments),
+                transfer_count=itinerary.transfer_count,
+                itinerary={"itineraryId": itinerary.itinerary_id},
+            )
+            if response_ref is not None:
+                metadata["capture_ref"] = response_ref.capture_id
+                metadata["capture_parser_version"] = response_ref.parser_version
+            evidence.append(
+                FlightEvidence(
+                    source_name="flights.ctrip.com",
+                    url=source_url,
+                    price=itinerary.price,
+                    currency=intent.currency or "CNY",
+                    departure_time=departure_time,
+                    arrival_time=_parse_ctrip_datetime(
+                        last_segment.get("arrival_time"),
+                        airport_code=last_segment.get("arrival_airport_code"),
+                    ),
+                    captured_at=captured_at,
+                    origin=intent.origin,
+                    destination=intent.destination,
+                    travel_date=(
+                        departure_time.date() if departure_time else intent.travel_date
+                    ),
+                    metadata=metadata,
+                )
+            )
+        return _rank_ctrip_evidence(evidence, intent)[:max_results]
+
+
+class CtripNavigator:
+    """Browser navigation boundary for Ctrip search entrypoints."""
+
+    HOMEPAGE_URL = "https://flights.ctrip.com/online/channel/domestic"
+
+    def __init__(self, *, timeout_seconds: int = 30) -> None:
+        self.timeout_seconds = timeout_seconds
+
+    def search_urls(self, intent: FlightSearchIntent) -> list[str]:
+        return _build_ctrip_search_urls(intent)
+
+    def navigate(
+        self,
+        driver: object,
+        intent: FlightSearchIntent,
+        *,
+        entrypoint: str,
+        force_refresh: bool = False,
+    ) -> str:
+        search_urls = self.search_urls(intent)
+        if entrypoint == "international":
+            source_url = search_urls[0]
+            driver.get(source_url)
+        elif entrypoint == "online_list":
+            source_url = search_urls[1]
+            driver.get(source_url)
+        elif entrypoint == "homepage":
+            source_url = self.HOMEPAGE_URL
+            _drive_ctrip_homepage_search(
+                driver,
+                intent,
+                timeout_seconds=self.timeout_seconds,
+            )
+        else:
+            raise ValueError(f"Unsupported Ctrip entrypoint: {entrypoint}")
+        if force_refresh and entrypoint != "homepage":
+            driver.refresh()
+        return source_url
+
+
+class BrowserSessionManager:
+    """Owns browser lifecycle and optional Ctrip authentication state."""
+
     def __init__(
         self,
         *,
-        browser: str = "edge",
-        headless: bool = True,
-        timeout_seconds: int = 30,
-        direct_only: bool = False,
-        max_results: int = 5,
-        login_allowed: bool = False,
-        accounts: list[str] | None = None,
-        passwords: list[str] | None = None,
-        cookies_file: str | os.PathLike[str] = DEFAULT_CTRIP_COOKIES_FILE,
-        login_wait_seconds: int = 300,
-        manual_verification_wait_seconds: int = 0,
-        reuse_browser_session: bool = True,
+        browser: str,
+        headless: bool,
+        reuse_browser_session: bool,
+        login_allowed: bool,
+        accounts: Sequence[str],
+        passwords: Sequence[str],
+        cookies_file: Path,
+        timeout_seconds: int,
+        login_wait_seconds: int,
+        driver_factory: Callable[..., object] | None = None,
     ) -> None:
         self.browser = browser
         self.headless = headless
-        self.timeout_seconds = timeout_seconds
-        self.direct_only = direct_only
-        self.max_results = max_results
-        self.login_allowed = login_allowed
-        self.accounts = accounts or []
-        self.passwords = passwords or []
-        self.cookies_file = Path(cookies_file)
-        self.login_wait_seconds = login_wait_seconds
-        self.manual_verification_wait_seconds = manual_verification_wait_seconds
         self.reuse_browser_session = reuse_browser_session
-        self._driver = None
+        self.login_allowed = login_allowed
+        self.accounts = list(accounts)
+        self.passwords = list(passwords)
+        self.cookies_file = cookies_file
+        self.timeout_seconds = timeout_seconds
+        self.login_wait_seconds = login_wait_seconds
+        self._driver_factory = driver_factory or _init_seleniumwire_driver
+        self._driver: object | None = None
         self._driver_ready = False
-        self._driver_lock = threading.RLock()
-        self._preferred_search_url_index: int | None = None
-        atexit.register(self.close)
+        self._lock = threading.RLock()
 
-    def supports(self, url: str) -> bool:
-        return urllib.parse.urlparse(url).scheme == CTRIP_SCHEME
+    @property
+    def ready(self) -> bool:
+        return self._driver_ready
+
+    def acquire(self) -> tuple[object, bool]:
+        if not self.reuse_browser_session:
+            return self._driver_factory(browser=self.browser, headless=self.headless), True
+        with self._lock:
+            if self._driver is None:
+                self._driver = self._driver_factory(
+                    browser=self.browser,
+                    headless=self.headless,
+                )
+                return self._driver, True
+            return self._driver, False
+
+    def prepare(self, driver: object, *, is_new: bool) -> None:
+        if self.login_allowed and (is_new or not self._driver_ready):
+            _CtripLoginSession(
+                accounts=self.accounts,
+                passwords=self.passwords,
+                cookies_file=self.cookies_file,
+                timeout_seconds=self.timeout_seconds,
+                login_wait_seconds=self.login_wait_seconds,
+            ).ensure_login(driver)
+        if self.reuse_browser_session:
+            self._driver_ready = True
+
+    def release(self, driver: object) -> None:
+        if self.reuse_browser_session:
+            return
+        _quit_driver(driver)
 
     def close(self) -> None:
-        with self._driver_lock:
+        with self._lock:
             driver = self._driver
             self._driver = None
             self._driver_ready = False
         if driver is not None:
-            try:
-                driver.quit()
-            except Exception:
-                pass
+            _quit_driver(driver)
 
-    def _acquire_driver(self):
-        if not self.reuse_browser_session:
-            return _init_seleniumwire_driver(browser=self.browser, headless=self.headless), True
-        with self._driver_lock:
-            if self._driver is None:
-                self._driver = _init_seleniumwire_driver(browser=self.browser, headless=self.headless)
-                return self._driver, True
-            return self._driver, False
 
-    def extract(self, url: str) -> list[FlightEvidence]:
-        intent = parse_ctrip_selenium_url(url)
-        driver, is_new_driver = self._acquire_driver()
+class CtripCaptureBackend:
+    """Captures batchSearch responses and writes a redacted response reference."""
+
+    def __init__(
+        self,
+        *,
+        response_store: RawResponseStore | None = None,
+        parser_version: str = CtripPayloadParser.version,
+    ) -> None:
+        self.response_store = response_store or InMemoryRawResponseStore()
+        self.parser_version = parser_version
+
+    def clear(self, driver: object) -> None:
+        try:
+            del driver.requests
+        except AttributeError:
+            pass
+
+    def capture(
+        self,
+        driver: object,
+        *,
+        source_url: str,
+        timeout_seconds: int,
+        manual_verification_wait_seconds: int,
+    ) -> CapturedCtripResponse:
+        payload = _wait_for_ctrip_search_payload(
+            driver,
+            timeout_seconds=timeout_seconds,
+            manual_verification_wait_seconds=manual_verification_wait_seconds,
+        )
+        captured_at = datetime.now(timezone.utc)
+        response_ref = self.response_store.store(
+            payload,
+            source_url=source_url,
+            captured_at=captured_at,
+            parser_version=self.parser_version,
+        )
+        return CapturedCtripResponse(
+            payload=payload,
+            source_url=source_url,
+            captured_at=captured_at,
+            response_ref=response_ref,
+        )
+
+
+EvidenceFactory = Callable[..., list[FlightEvidence]]
+
+
+class CtripFlightBackend:
+    """Composes navigation, browser sessions, capture, parsing and evidence mapping."""
+
+    def __init__(
+        self,
+        *,
+        navigator: CtripNavigatorProtocol,
+        session_manager: BrowserSessionManagerProtocol,
+        capture_backend: CtripCaptureBackendProtocol,
+        payload_parser: CtripPayloadParser | None = None,
+        evidence_mapper: FlightEvidenceMapper | None = None,
+        evidence_factory: EvidenceFactory | None = None,
+        timeout_seconds: int = 30,
+        direct_only: bool = False,
+        max_results: int = 5,
+        manual_verification_wait_seconds: int = 0,
+    ) -> None:
+        self.navigator = navigator
+        self.session_manager = session_manager
+        self.capture_backend = capture_backend
+        self.payload_parser = payload_parser or CtripPayloadParser()
+        self.evidence_mapper = evidence_mapper or FlightEvidenceMapper()
+        self.evidence_factory = evidence_factory
+        self.timeout_seconds = timeout_seconds
+        self.direct_only = direct_only
+        self.max_results = max_results
+        self.manual_verification_wait_seconds = manual_verification_wait_seconds
+        self._preferred_search_url_index: int | None = None
+
+    def close(self) -> None:
+        self.session_manager.close()
+
+    def extract(self, intent: FlightSearchIntent) -> list[FlightEvidence]:
+        driver, is_new_driver = self.session_manager.acquire()
         errors: list[str] = []
         fallback_evidence: list[FlightEvidence] = []
         try:
-            if self.login_allowed and (is_new_driver or not self._driver_ready):
-                _CtripLoginSession(
-                    accounts=self.accounts,
-                    passwords=self.passwords,
-                    cookies_file=self.cookies_file,
-                    timeout_seconds=self.timeout_seconds,
-                    login_wait_seconds=self.login_wait_seconds,
-                ).ensure_login(driver)
-            if self.reuse_browser_session:
-                self._driver_ready = True
-            search_urls = _build_ctrip_search_urls(intent)
-            indexed_search_urls = list(enumerate(search_urls))
+            self.session_manager.prepare(driver, is_new=is_new_driver)
+            search_urls = self.navigator.search_urls(intent)
+            indexed_entrypoints = list(enumerate(("international", "online_list")))
             if (
                 self._preferred_search_url_index is not None
-                and 0 <= self._preferred_search_url_index < len(search_urls)
+                and 0 <= self._preferred_search_url_index < len(indexed_entrypoints)
             ):
                 preferred = self._preferred_search_url_index
-                indexed_search_urls.sort(key=lambda item: 0 if item[0] == preferred else 1)
-            for search_url_index, search_url in indexed_search_urls:
+                indexed_entrypoints.sort(
+                    key=lambda item: 0 if item[0] == preferred else 1
+                )
+            for search_url_index, entrypoint in indexed_entrypoints:
                 try:
-                    del driver.requests
-                except AttributeError:
-                    pass
-                try:
-                    driver.get(search_url)
-                    payload = _wait_for_ctrip_search_payload(
+                    evidence, source_url = self._capture_and_map(
                         driver,
-                        timeout_seconds=self.timeout_seconds,
-                        manual_verification_wait_seconds=self.manual_verification_wait_seconds,
-                    )
-                    evidence = parse_ctrip_batch_search_payload(
-                        payload,
                         intent,
-                        source_url=search_url,
-                        direct_only=self.direct_only,
-                        max_results=self.max_results,
+                        entrypoint=entrypoint,
                     )
-                    if not evidence:
-                        evidence = _retry_after_manual_verification_if_present(
-                            driver,
-                            intent,
-                            source_url=search_url,
-                            direct_only=self.direct_only,
-                            max_results=self.max_results,
-                            timeout_seconds=self.timeout_seconds,
-                            manual_verification_wait_seconds=self.manual_verification_wait_seconds,
-                        )
                     if evidence:
                         self._preferred_search_url_index = search_url_index
                         if _evidence_satisfies_requested_time(evidence, intent):
                             return evidence
                         if not fallback_evidence:
                             fallback_evidence = evidence
-                        errors.append(f"{search_url}:NoTimePreferenceMatch:{intent.time_preference}")
-                        continue
-                    errors.append(f"{search_url}:NoFlightEvidence:batchSearch returned no parsable itineraries")
+                        errors.append(
+                            f"{source_url}:NoTimePreferenceMatch:{intent.time_preference}"
+                        )
+                    else:
+                        errors.append(
+                            f"{search_urls[search_url_index]}:NoFlightEvidence:"
+                            "batchSearch returned no parsable itineraries"
+                        )
                 except Exception as exc:
-                    errors.append(f"{search_url}:{type(exc).__name__}:{str(exc).split('Stacktrace:')[0]}")
-                    continue
+                    errors.append(_attempt_error_text(entrypoint, exc))
+
             try:
-                del driver.requests
-            except AttributeError:
-                pass
-            try:
-                search_url = "https://flights.ctrip.com/online/channel/domestic"
-                _drive_ctrip_homepage_search(driver, intent, timeout_seconds=self.timeout_seconds)
-                payload = _wait_for_ctrip_search_payload(
+                evidence, source_url = self._capture_and_map(
                     driver,
-                    timeout_seconds=self.timeout_seconds,
-                    manual_verification_wait_seconds=self.manual_verification_wait_seconds,
-                )
-                evidence = parse_ctrip_batch_search_payload(
-                    payload,
                     intent,
-                    source_url=search_url,
-                    direct_only=self.direct_only,
-                    max_results=self.max_results,
+                    entrypoint="homepage",
                 )
-                if not evidence:
-                    evidence = _retry_after_manual_verification_if_present(
-                        driver,
-                        intent,
-                        source_url=search_url,
-                        direct_only=self.direct_only,
-                        max_results=self.max_results,
-                        timeout_seconds=self.timeout_seconds,
-                        manual_verification_wait_seconds=self.manual_verification_wait_seconds,
-                    )
                 if evidence:
                     if _evidence_satisfies_requested_time(evidence, intent):
                         return evidence
                     if not fallback_evidence:
                         fallback_evidence = evidence
-                    errors.append(f"homepage_ui:NoTimePreferenceMatch:{intent.time_preference}")
+                    errors.append(
+                        f"{source_url}:NoTimePreferenceMatch:{intent.time_preference}"
+                    )
                 else:
-                    errors.append("homepage_ui:NoFlightEvidence:batchSearch returned no parsable itineraries")
+                    errors.append(
+                        "homepage_ui:NoFlightEvidence:"
+                        "batchSearch returned no parsable itineraries"
+                    )
             except Exception as exc:
-                errors.append(f"homepage_ui:{type(exc).__name__}:{str(exc).split('Stacktrace:')[0]}")
+                errors.append(_attempt_error_text("homepage_ui", exc))
             if fallback_evidence:
                 return fallback_evidence
             if errors:
-                raise RuntimeError("Ctrip SeleniumWire extraction failed; attempts=" + " | ".join(errors))
+                raise RuntimeError(
+                    "Ctrip SeleniumWire extraction failed; attempts="
+                    + " | ".join(errors)
+                )
             return []
         finally:
-            if not self.reuse_browser_session:
-                driver.quit()
-            elif not self._driver_ready:
-                self.close()
+            self.session_manager.release(driver)
 
     def extract_attempt(
         self,
-        url: str,
+        intent: FlightSearchIntent,
         *,
         entrypoint: str,
         action_id: str,
         force_refresh: bool = False,
     ) -> FlightPageAttemptResult:
         del action_id
-        intent = parse_ctrip_selenium_url(url)
-        driver, is_new_driver = self._acquire_driver()
+        driver, is_new_driver = self.session_manager.acquire()
         source_url: str | None = None
         try:
-            if self.login_allowed and (is_new_driver or not self._driver_ready):
-                _CtripLoginSession(
-                    accounts=self.accounts,
-                    passwords=self.passwords,
-                    cookies_file=self.cookies_file,
-                    timeout_seconds=self.timeout_seconds,
-                    login_wait_seconds=self.login_wait_seconds,
-                ).ensure_login(driver)
-            if self.reuse_browser_session:
-                self._driver_ready = True
-            try:
-                del driver.requests
-            except AttributeError:
-                pass
-
-            search_urls = _build_ctrip_search_urls(intent)
-            if entrypoint == "international":
-                source_url = search_urls[0]
-                driver.get(source_url)
-            elif entrypoint == "online_list":
-                source_url = search_urls[1]
-                driver.get(source_url)
-            elif entrypoint == "homepage":
-                source_url = "https://flights.ctrip.com/online/channel/domestic"
-                _drive_ctrip_homepage_search(driver, intent, timeout_seconds=self.timeout_seconds)
-            else:
-                return FlightPageAttemptResult(
-                    status="tool_error",
-                    evidence=[],
-                    entrypoint=entrypoint,
-                    warning=f"unsupported Ctrip entrypoint: {entrypoint}",
-                )
-
-            if force_refresh and entrypoint != "homepage":
-                driver.refresh()
-            payload = _wait_for_ctrip_search_payload(
+            self.session_manager.prepare(driver, is_new=is_new_driver)
+            evidence, source_url = self._capture_and_map(
                 driver,
-                timeout_seconds=self.timeout_seconds,
-                manual_verification_wait_seconds=0,
-            )
-            evidence = parse_ctrip_batch_search_payload(
-                payload,
                 intent,
-                source_url=source_url,
-                direct_only=self.direct_only,
-                max_results=self.max_results,
+                entrypoint=entrypoint,
+                force_refresh=force_refresh,
+                manual_verification_wait_seconds=0,
             )
             if not evidence:
                 return FlightPageAttemptResult(
@@ -280,7 +559,11 @@ class CtripSeleniumWirePageExtractor:
                     source_url=source_url,
                     warning="batchSearch returned no parsable itineraries",
                 )
-            status = "success" if _evidence_satisfies_requested_time(evidence, intent) else "time_preference_mismatch"
+            status = (
+                "success"
+                if _evidence_satisfies_requested_time(evidence, intent)
+                else "time_preference_mismatch"
+            )
             return FlightPageAttemptResult(
                 status=status,
                 evidence=evidence,
@@ -304,10 +587,187 @@ class CtripSeleniumWirePageExtractor:
                 warning=f"{type(exc).__name__}:{str(exc).split('Stacktrace:')[0]}",
             )
         finally:
-            if not self.reuse_browser_session:
-                driver.quit()
-            elif not self._driver_ready:
-                self.close()
+            self.session_manager.release(driver)
+
+    def _capture_and_map(
+        self,
+        driver: object,
+        intent: FlightSearchIntent,
+        *,
+        entrypoint: str,
+        force_refresh: bool = False,
+        manual_verification_wait_seconds: int | None = None,
+    ) -> tuple[list[FlightEvidence], str]:
+        self.capture_backend.clear(driver)
+        source_url = self.navigator.navigate(
+            driver,
+            intent,
+            entrypoint=entrypoint,
+            force_refresh=force_refresh,
+        )
+        effective_manual_wait = (
+            self.manual_verification_wait_seconds
+            if manual_verification_wait_seconds is None
+            else manual_verification_wait_seconds
+        )
+        capture = self.capture_backend.capture(
+            driver,
+            source_url=source_url,
+            timeout_seconds=self.timeout_seconds,
+            manual_verification_wait_seconds=effective_manual_wait,
+        )
+        evidence = self._map_capture(capture, intent)
+        if (
+            not evidence
+            and effective_manual_wait > 0
+            and _is_manual_verification_present(driver)
+        ):
+            _wait_for_manual_verification(
+                driver,
+                effective_manual_wait,
+            )
+            self.capture_backend.clear(driver)
+            capture = self.capture_backend.capture(
+                driver,
+                source_url=source_url,
+                timeout_seconds=self.timeout_seconds,
+                manual_verification_wait_seconds=0,
+            )
+            evidence = self._map_capture(capture, intent)
+        return evidence, source_url
+
+    def _map_capture(
+        self,
+        capture: CapturedCtripResponse,
+        intent: FlightSearchIntent,
+    ) -> list[FlightEvidence]:
+        if self.evidence_factory is not None:
+            return self.evidence_factory(
+                capture.payload,
+                intent,
+                source_url=capture.source_url,
+                direct_only=self.direct_only,
+                max_results=self.max_results,
+                captured_at=capture.captured_at,
+                response_ref=capture.response_ref,
+            )
+        return self.evidence_mapper.map(
+            self.payload_parser.parse(capture.payload),
+            intent,
+            source_url=capture.source_url,
+            captured_at=capture.captured_at,
+            direct_only=self.direct_only,
+            max_results=self.max_results,
+            response_ref=capture.response_ref,
+        )
+
+
+class CtripSeleniumWirePageExtractor:
+    """Compatibility PageExtractor adapter backed by composable Ctrip components."""
+
+    def __init__(
+        self,
+        *,
+        browser: str = "edge",
+        headless: bool = True,
+        timeout_seconds: int = 30,
+        direct_only: bool = False,
+        max_results: int = 5,
+        login_allowed: bool = False,
+        accounts: list[str] | None = None,
+        passwords: list[str] | None = None,
+        cookies_file: str | os.PathLike[str] = DEFAULT_CTRIP_COOKIES_FILE,
+        login_wait_seconds: int = 300,
+        manual_verification_wait_seconds: int = 0,
+        reuse_browser_session: bool = True,
+        backend: CtripFlightBackend | None = None,
+    ) -> None:
+        self.browser = browser
+        self.headless = headless
+        self.timeout_seconds = timeout_seconds
+        self.direct_only = direct_only
+        self.max_results = max_results
+        self.login_allowed = login_allowed
+        self.accounts = accounts or []
+        self.passwords = passwords or []
+        self.cookies_file = Path(cookies_file)
+        self.login_wait_seconds = login_wait_seconds
+        self.manual_verification_wait_seconds = manual_verification_wait_seconds
+        self.reuse_browser_session = reuse_browser_session
+        self.backend = backend or CtripFlightBackend(
+            navigator=CtripNavigator(timeout_seconds=timeout_seconds),
+            session_manager=BrowserSessionManager(
+                browser=browser,
+                headless=headless,
+                reuse_browser_session=reuse_browser_session,
+                login_allowed=login_allowed,
+                accounts=self.accounts,
+                passwords=self.passwords,
+                cookies_file=self.cookies_file,
+                timeout_seconds=timeout_seconds,
+                login_wait_seconds=login_wait_seconds,
+            ),
+            capture_backend=CtripCaptureBackend(),
+            # Keep the historical parser symbol patchable while it delegates
+            # to the pure parser and mapper above in normal operation.
+            evidence_factory=_legacy_payload_to_evidence,
+            timeout_seconds=timeout_seconds,
+            direct_only=direct_only,
+            max_results=max_results,
+            manual_verification_wait_seconds=manual_verification_wait_seconds,
+        )
+        atexit.register(self.close)
+
+    def supports(self, url: str) -> bool:
+        return urllib.parse.urlparse(url).scheme == CTRIP_SCHEME
+
+    def close(self) -> None:
+        self.backend.close()
+
+    def extract(self, url: str) -> list[FlightEvidence]:
+        return self.backend.extract(parse_ctrip_selenium_url(url))
+
+    def extract_attempt(
+        self,
+        url: str,
+        *,
+        entrypoint: str,
+        action_id: str,
+        force_refresh: bool = False,
+    ) -> FlightPageAttemptResult:
+        return self.backend.extract_attempt(
+            parse_ctrip_selenium_url(url),
+            entrypoint=entrypoint,
+            action_id=action_id,
+            force_refresh=force_refresh,
+        )
+
+
+def _legacy_payload_to_evidence(
+    payload: dict[str, Any],
+    intent: FlightSearchIntent,
+    **kwargs: object,
+) -> list[FlightEvidence]:
+    return parse_ctrip_batch_search_payload(
+        payload,
+        intent,
+        source_url=str(kwargs["source_url"]),
+        direct_only=bool(kwargs["direct_only"]),
+        max_results=int(kwargs["max_results"]),
+        captured_at=kwargs.get("captured_at") if isinstance(kwargs.get("captured_at"), datetime) else None,
+        response_ref=kwargs.get("response_ref") if isinstance(kwargs.get("response_ref"), RawResponseRef) else None,
+    )
+
+
+def _attempt_error_text(entrypoint: str, exc: Exception) -> str:
+    return f"{entrypoint}:{type(exc).__name__}:{str(exc).split('Stacktrace:')[0]}"
+
+
+def _quit_driver(driver: object) -> None:
+    try:
+        driver.quit()
+    except Exception:
+        pass
 
 
 def build_ctrip_selenium_url(intent: FlightSearchIntent) -> str:
@@ -343,6 +803,23 @@ def decode_ctrip_response_body(body: bytes) -> dict[str, Any]:
     except OSError:
         text = body.decode("utf-8")
     return json.loads(text)
+
+
+def _redact_capture_value(
+    value: object,
+    sensitive_markers: Sequence[str],
+) -> object:
+    if isinstance(value, dict):
+        output: dict[str, object] = {}
+        for key, item in value.items():
+            if any(marker in str(key).casefold() for marker in sensitive_markers):
+                output[str(key)] = "[REDACTED]"
+            else:
+                output[str(key)] = _redact_capture_value(item, sensitive_markers)
+        return output
+    if isinstance(value, list):
+        return [_redact_capture_value(item, sensitive_markers) for item in value]
+    return value
 
 
 def _wait_for_ctrip_search_payload(
@@ -399,38 +876,6 @@ def _ctrip_attempt_status(exc: Exception) -> str:
     if isinstance(exc, (ValueError, KeyError, TypeError, json.JSONDecodeError)):
         return "parse_failed"
     return "tool_error"
-
-
-def _retry_after_manual_verification_if_present(
-    driver,
-    intent: FlightSearchIntent,
-    *,
-    source_url: str,
-    direct_only: bool,
-    max_results: int,
-    timeout_seconds: int,
-    manual_verification_wait_seconds: int,
-) -> list[FlightEvidence]:
-    if manual_verification_wait_seconds <= 0 or not _is_manual_verification_present(driver):
-        return []
-    _wait_for_manual_verification(driver, manual_verification_wait_seconds)
-    try:
-        payload = _wait_for_ctrip_search_payload(
-            driver,
-            timeout_seconds=timeout_seconds,
-            manual_verification_wait_seconds=0,
-        )
-    except Exception:
-        payload = _extract_latest_ctrip_search_payload(driver)
-    if payload is None:
-        return []
-    return parse_ctrip_batch_search_payload(
-        payload,
-        intent,
-        source_url=source_url,
-        direct_only=direct_only,
-        max_results=max_results,
-    )
 
 
 def _extract_latest_ctrip_search_payload(driver) -> dict[str, Any] | None:
@@ -497,62 +942,18 @@ def parse_ctrip_batch_search_payload(
     source_url: str,
     direct_only: bool,
     max_results: int,
+    captured_at: datetime | None = None,
+    response_ref: RawResponseRef | None = None,
 ) -> list[FlightEvidence]:
-    itineraries = payload.get("data", {}).get("flightItineraryList", [])
-    evidence: list[FlightEvidence] = []
-    captured_at = datetime.now(timezone.utc)
-    for itinerary in itineraries:
-        segments = itinerary.get("flightSegments", [])
-        if not segments:
-            continue
-        itinerary_segments = _itinerary_segments(segments)
-        if not itinerary_segments:
-            continue
-        transfer_count = _transfer_count(segments, itinerary_segments)
-        if direct_only and transfer_count != 0:
-            continue
-        price = _lowest_price(itinerary.get("priceList", []))
-        if price is None:
-            continue
-        first_segment = itinerary_segments[0]
-        last_segment = itinerary_segments[-1]
-        if not _ctrip_airport_matches_request(
-            first_segment.get("departure_airport_code"),
-            intent.origin,
-        ):
-            continue
-        if not _ctrip_airport_matches_request(
-            last_segment.get("arrival_airport_code"),
-            intent.destination,
-        ):
-            continue
-        departure_time = _parse_ctrip_datetime(
-            first_segment.get("departure_time"),
-            airport_code=first_segment.get("departure_airport_code"),
-        )
-        evidence.append(
-            FlightEvidence(
-                source_name="flights.ctrip.com",
-                url=source_url,
-                price=price,
-                currency=intent.currency or "CNY",
-                departure_time=departure_time,
-                arrival_time=_parse_ctrip_datetime(
-                    last_segment.get("arrival_time"),
-                    airport_code=last_segment.get("arrival_airport_code"),
-                ),
-                captured_at=captured_at,
-                origin=intent.origin,
-                destination=intent.destination,
-                travel_date=departure_time.date() if departure_time else intent.travel_date,
-                metadata=_flight_metadata(
-                    itinerary_segments=itinerary_segments,
-                    transfer_count=transfer_count,
-                    itinerary=itinerary,
-                ),
-            )
-        )
-    return _rank_ctrip_evidence(evidence, intent)[:max_results]
+    return FlightEvidenceMapper().map(
+        CtripPayloadParser().parse(payload),
+        intent,
+        source_url=source_url,
+        captured_at=captured_at or datetime.now(timezone.utc),
+        direct_only=direct_only,
+        max_results=max_results,
+        response_ref=response_ref,
+    )
 
 
 def _intent_from_query(query: str) -> FlightSearchIntent | None:

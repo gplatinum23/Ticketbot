@@ -57,6 +57,14 @@ from .places import (
     station_city_for_airport,
 )
 from .progress import ProgressReporter, get_progress_reporter
+from .route_diversity import (
+    DiversityCandidate,
+    RouteSkeleton,
+    ValueProfile,
+    build_route_skeleton,
+    select_diverse_candidates,
+    shared_downstream_flight_service,
+)
 from .travel_tools import (
     CachedFlightSearchTool,
     CachedTrainSearchTool,
@@ -64,7 +72,7 @@ from .travel_tools import (
     FlightSearchRequest,
     FlightSearchTool,
     ToolError,
-    InMemoryToolCache,
+    ToolCache,
     ToolMetrics,
     ToolResult,
     ToolStatus,
@@ -155,6 +163,8 @@ class CandidateRoute:
     segment_count: int | None = None
     score: float | None = None
     feasibility: FeasibilityResult | None = None
+    skeleton: RouteSkeleton | None = None
+    value_profiles: tuple[ValueProfile, ...] = ()
 
 
 class TravelPlanState(TypedDict, total=False):
@@ -180,6 +190,7 @@ class TravelPlanState(TypedDict, total=False):
     query_execution_stats: dict[str, int]
     candidate_routes: list[CandidateRoute]
     rejected_candidate_routes: list[CandidateRoute]
+    route_selection_stats: dict[str, int]
     response: str
     warnings: list[str]
 
@@ -193,7 +204,7 @@ def build_react_flight_search_tool(
     verifier: FlightEvidenceVerifier | None = None,
     progress_reporter: ProgressReporter | None = None,
     human_verification_handler=None,
-    cache: InMemoryToolCache | None = None,
+    cache: ToolCache | None = None,
 ) -> FlightSearchTool:
     evidence_verifier = verifier or FlightEvidenceVerifier()
     batch_evidence_judge = (
@@ -745,6 +756,52 @@ def build_travel_plan_graph(
             "warnings": warnings,
         }
 
+    def select_diverse_routes(state: TravelPlanState) -> TravelPlanState:
+        progress.emit("选择多样化路线...")
+        routes = state.get("candidate_routes", [])
+        selection = select_diverse_candidates(
+            [
+                _diversity_candidate(route, ranked_index=index)
+                for index, route in enumerate(routes)
+            ],
+            limit=5,
+        )
+        routes_by_id = {route.route_id: route for route in routes}
+        selected_routes = [
+            replace(
+                routes_by_id[item.route_id],
+                skeleton=item.skeleton,
+                value_profiles=item.value_profiles,
+            )
+            for item in selection.selected
+            if item.route_id in routes_by_id
+        ]
+        warnings = list(state.get("warnings", []))
+        if selection.exact_duplicates_removed:
+            warnings.append(
+                "route_skeleton_duplicates_removed:"
+                f"{selection.exact_duplicates_removed}"
+            )
+        if selection.family_variants_limited:
+            warnings.append(
+                "shared_downstream_variants_limited:"
+                f"{selection.family_variants_limited}"
+            )
+        if len(selected_routes) < 5:
+            warnings.append(f"distinct_top_candidates:{len(selected_routes)}/5")
+        return {
+            **state,
+            "candidate_routes": selected_routes,
+            "route_selection_stats": {
+                "selected": len(selected_routes),
+                "requested": 5,
+                "available_distinct_routes": selection.available_distinct_routes,
+                "exact_duplicates_removed": selection.exact_duplicates_removed,
+                "family_variants_limited": selection.family_variants_limited,
+            },
+            "warnings": warnings,
+        }
+
     def render_response(state: TravelPlanState) -> TravelPlanState:
         progress.emit("生成最终推荐结果...")
         routes = state.get("candidate_routes", [])
@@ -785,9 +842,14 @@ def build_travel_plan_graph(
                 ),
             }
 
+        selection_stats = state.get("route_selection_stats", {})
         lines = ["Top travel candidates:"]
-        for index, route in enumerate(routes[:5], start=1):
-            route_summary = route.summary + _feasibility_suffix(route)
+        for index, route in enumerate(routes, start=1):
+            route_summary = (
+                route.summary
+                + _value_profile_suffix(route)
+                + _feasibility_suffix(route)
+            )
             if route.route_type == "train" and route.train_option:
                 lines.append(f"{index}. {route_summary}")
                 continue
@@ -806,6 +868,12 @@ def build_travel_plan_graph(
                 f"{index}. {route_summary}; evidence={option.evidence_count}; "
                 f"sources={source_names}; reliability={option.reliability}"
             )
+        if len(routes) < 5:
+            available = selection_stats.get("available_distinct_routes", len(routes))
+            lines.append(
+                f"Only {len(routes)} sufficiently distinct usable routes "
+                f"were selected from {available} distinct candidates."
+            )
         if warnings:
             lines.append("Warnings: " + "; ".join(warnings))
         return {**state, "response": "\n".join(lines)}
@@ -820,6 +888,7 @@ def build_travel_plan_graph(
     graph.add_node("build_candidate_routes", build_candidate_routes)
     graph.add_node("evaluate_route_feasibility", evaluate_route_feasibility)
     graph.add_node("rank_routes", rank_routes)
+    graph.add_node("select_diverse_routes", select_diverse_routes)
     graph.add_node("render_response", render_response)
 
     graph.add_edge(START, "classify_region")
@@ -832,7 +901,8 @@ def build_travel_plan_graph(
     graph.add_edge("execute_query_plan", "build_candidate_routes")
     graph.add_edge("build_candidate_routes", "evaluate_route_feasibility")
     graph.add_edge("evaluate_route_feasibility", "rank_routes")
-    graph.add_edge("rank_routes", "render_response")
+    graph.add_edge("rank_routes", "select_diverse_routes")
+    graph.add_edge("select_diverse_routes", "render_response")
     graph.add_edge("render_response", END)
 
     return graph.compile()
@@ -2153,6 +2223,76 @@ def _route_payload(routes: list[CandidateRoute]) -> dict[str, object]:
             }
         )
     return {"routes": serialized}
+
+
+def _diversity_candidate(
+    route: CandidateRoute,
+    *,
+    ranked_index: int,
+) -> DiversityCandidate:
+    edges = route.route_edges or []
+    operational_count = sum(edge.mode != "local_transfer" for edge in edges)
+    segment_count = route.segment_count or operational_count
+    return DiversityCandidate(
+        route_id=route.route_id,
+        skeleton=build_route_skeleton(
+            route_type=route.route_type,
+            edges=edges,
+            transfer_city=route.transfer_city,
+            transfer_airport=route.transfer_airport,
+        ),
+        total_price=route.total_price,
+        total_duration_minutes=route.total_duration_minutes,
+        transfer_wait_minutes=route.transfer_wait_minutes,
+        transfer_count=max(0, segment_count - 1),
+        risk_score=_route_risk_score(route),
+        ranked_index=ranked_index,
+        shared_downstream_service=shared_downstream_flight_service(edges),
+    )
+
+
+def _route_risk_score(route: CandidateRoute) -> float:
+    feasibility_penalty = {
+        FeasibilityStatus.FEASIBLE: 0.0,
+        FeasibilityStatus.UNCERTAIN: 0.55,
+        FeasibilityStatus.INFEASIBLE: 1.0,
+    }.get(
+        route.feasibility.status if route.feasibility is not None else None,
+        0.65,
+    )
+    edges = route.route_edges or []
+    confidence_penalty = 0.0
+    if edges:
+        confidence_penalty = 1.0 - (
+            sum(max(0.0, min(1.0, edge.confidence)) for edge in edges)
+            / len(edges)
+        )
+    slack_penalty = 0.0
+    if route.feasibility is not None and route.feasibility.connections:
+        known_slack = [
+            check.available_minutes - check.required_minutes
+            for check in route.feasibility.connections
+            if check.available_minutes is not None
+        ]
+        if not known_slack:
+            slack_penalty = 0.35
+        elif min(known_slack) < 30:
+            slack_penalty = 0.45
+        elif min(known_slack) < 60:
+            slack_penalty = 0.20
+    return min(
+        1.0,
+        feasibility_penalty
+        + 0.25 * confidence_penalty
+        + slack_penalty,
+    )
+
+
+def _value_profile_suffix(route: CandidateRoute) -> str:
+    if not route.value_profiles:
+        return ""
+    labels = ",".join(profile.value for profile in route.value_profiles)
+    return f"; value={labels}"
 
 
 def _feasibility_suffix(route: CandidateRoute) -> str:

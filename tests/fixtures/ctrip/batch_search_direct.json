@@ -1,0 +1,29 @@
+{
+  "data": {
+    "flightItineraryList": [
+      {
+        "itineraryId": "3U8899_20260731",
+        "flightSegments": [
+          {
+            "transferCount": 0,
+            "flightList": [
+              {
+                "flightNo": "3U8899",
+                "departureDateTime": "2026-07-31 08:00:00",
+                "arrivalDateTime": "2026-07-31 11:10:00",
+                "departureAirportCode": "CTU",
+                "arrivalAirportCode": "CJU"
+              }
+            ]
+          }
+        ],
+        "priceList": [
+          {
+            "adultPrice": 1100,
+            "adultTax": 100
+          }
+        ]
+      }
+    ]
+  }
+}
